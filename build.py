@@ -16,7 +16,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parent
 APP_NAME = "额度管理"
-PYTHON_VERSION = "3.12.14"
+PYTHON_VERSIONS = {"3.12.14", "3.13.17"}
 BROWSER_COMPONENTS = ("chromium", "ffmpeg", "winldd")
 
 
@@ -77,7 +77,7 @@ def copy_notices(output: Path, versions: dict[str, str]) -> None:
             parts = file.parts
             metadata_index = next((i for i, part in enumerate(parts) if part.endswith(".dist-info")), None)
             if metadata_index is None or not any(
-                part.lower().startswith(("license", "copying", "notice")) for part in parts
+                part.lower().startswith(("license", "licence", "copying", "notice")) for part in parts
             ):
                 continue
             source = Path(package.locate_file(file))
@@ -117,8 +117,9 @@ def validate_bundle(output: Path) -> None:
 def build(args: argparse.Namespace) -> Path:
     if sys.platform != "win32" or platform.machine().lower() not in {"amd64", "x86_64"}:
         raise RuntimeError("The portable build requires Windows x64.")
-    if platform.python_version() != PYTHON_VERSION:
-        raise RuntimeError(f"Use Python {PYTHON_VERSION} to match the locked build environment.")
+    python_version = platform.python_version()
+    if python_version not in PYTHON_VERSIONS:
+        raise RuntimeError(f"Use one of the supported Python versions: {', '.join(sorted(PYTHON_VERSIONS))}.")
     versions = locked_dependencies()
     output = args.output.expanduser().resolve()
     runtime = args.runtime.expanduser().resolve()
@@ -159,7 +160,7 @@ def build(args: argparse.Namespace) -> Path:
             if source.is_file():
                 shutil.copy2(source, bundle / name)
         (bundle / "BUILD-INFO.json").write_text(json.dumps({
-            "python": PYTHON_VERSION, "platform": "Windows x64",
+            "python": python_version, "platform": "Windows x64",
             "dependencies": versions, "browser_revisions": revisions,
         }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         validate_bundle(bundle)

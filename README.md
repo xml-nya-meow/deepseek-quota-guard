@@ -16,17 +16,17 @@ Windows 本地额度管理工具，当前为**候选预发布版**。它按人�
 
 ## 从源码运行
 
-需要 Windows x64 和 Python 3.12.14。以下命令均在仓库根目录执行，使用 PowerShell：
+需要 Windows x64 和 Python 3.13.17。以下命令均在仓库根目录执行，使用 PowerShell：
 
 ```powershell
-py -3.12 -m venv .venv
+py -3.13 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.lock
 $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $PWD 'browser-runtime'
 .\.venv\Scripts\python.exe -m playwright install chromium
 .\.venv\Scripts\python.exe main.py --data-dir .\data
 ```
 
-先用 `py -3.12 --version` 确认补丁版本为 3.12.14。安装依赖和浏览器会联网下载软件；首次运行应用不会自动调用付费模型接口。平台登录和费用读取需要网络。
+先用 `py -3.13 --version` 确认补丁版本为 3.13.17。构建也支持已有的 Python 3.12.14 环境，实际版本记录在 `BUILD-INFO.json` 中。安装依赖和浏览器会联网下载软件；首次运行应用不会自动调用付费模型接口。平台登录和费用读取需要网络。
 
 `requirements.txt` 列出直接依赖，`requirements.lock` 固定当前 Windows 构建环境中的直接与传递依赖。请使用干净虚拟环境，更新依赖时同时更新锁文件和第三方声明。
 
