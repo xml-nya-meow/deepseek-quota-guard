@@ -14,7 +14,7 @@
 
 本文件记录第三方组件与来源，不替代本项目自身的许可证。
 
-`third_party/tcl-8.6.12-license.terms` 来自 [Tcl core-8-6-12 原始许可](https://github.com/tcltk/tcl/blob/core-8-6-12/license.terms)，用于补齐该版本运行时可能缺少的许可原文。构建优先使用运行时附带许可，记录实际 Tcl 版本；其他 Tcl 版本缺少许可时会停止构建。
+`third_party/` 保存 [Tcl core-8-6-12 原始许可](https://github.com/tcltk/tcl/blob/core-8-6-12/license.terms) 和 [Tcl core-8-6-15 原始许可](https://github.com/tcltk/tcl/blob/core-8-6-15/license.terms)，用于补齐对应运行时可能缺少的许可原文。构建优先使用运行时附带许可，记录实际 Tcl 版本；其他 Tcl 版本缺少许可时会停止构建。
 
 公开资料用于确认边界或参考格式；未把下列项目整套代码移入程序，也未采用其读取浏览器令牌的方式。
 

@@ -106,9 +106,9 @@ def copy_notices(output: Path, versions: dict[str, str]) -> dict[str, str]:
         if combined.is_file():
             tcl_license = combined
             tcl_source = 'Python Tcl/Tk notice'
-        elif tcl_version == '8.6.12':
-            tcl_license = ROOT / 'third_party' / 'tcl-8.6.12-license.terms'
-            tcl_source = 'tcltk/tcl core-8-6-12'
+        elif tcl_version in {'8.6.12', '8.6.15'}:
+            tcl_license = ROOT / 'third_party' / f'tcl-{tcl_version}-license.terms'
+            tcl_source = 'tcltk/tcl core-' + tcl_version.replace('.', '-')
         else:
             raise RuntimeError(f'Tcl {tcl_version} license missing; supply its matching upstream notice before publishing.')
     tcl_target = notices / 'Tcl' / 'license.terms'
