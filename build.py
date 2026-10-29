@@ -68,7 +68,7 @@ def browser_components(runtime: Path) -> tuple[list[Path], dict[str, str]]:
     return folders, revisions
 
 
-def copy_notices(output: Path, versions: dict[str, str]) -> None:
+def copy_notices(output: Path, versions: dict[str, str]) -> dict[str, str]:
     notices = output / "第三方许可"
     notices.mkdir()
     for name in versions:
@@ -95,6 +95,26 @@ def copy_notices(output: Path, versions: dict[str, str]) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
 
+    import tkinter
+    interpreter = tkinter.Tcl()
+    tcl_version = interpreter.eval('info patchlevel')
+    tcl_library = Path(interpreter.eval('info library'))
+    tcl_license = tcl_library / 'license.terms'
+    tcl_source = 'installed Tcl'
+    if not tcl_license.is_file():
+        combined = Path(sys.base_prefix) / 'Doc' / 'license.tcltk'
+        if combined.is_file():
+            tcl_license = combined
+            tcl_source = 'Python Tcl/Tk notice'
+        elif tcl_version == '8.6.12':
+            tcl_license = ROOT / 'third_party' / 'tcl-8.6.12-license.terms'
+            tcl_source = 'tcltk/tcl core-8-6-12'
+        else:
+            raise RuntimeError(f'Tcl {tcl_version} license missing; supply its matching upstream notice before publishing.')
+    tcl_target = notices / 'Tcl' / 'license.terms'
+    tcl_target.parent.mkdir(exist_ok=True)
+    shutil.copy2(tcl_license, tcl_target)
+
     import playwright
     driver = Path(playwright.__file__).resolve().parent / "driver"
     for relative in ("LICENSE", "LICENSE.txt", "package/LICENSE", "package/NOTICE"):
@@ -103,6 +123,7 @@ def copy_notices(output: Path, versions: dict[str, str]) -> None:
             target = notices / "Playwright-driver" / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
+    return {'tcl_version': tcl_version, 'tcl_license_source': tcl_source}
 
 
 def validate_bundle(output: Path) -> None:
@@ -154,7 +175,7 @@ def build(args: argparse.Namespace) -> Path:
             *data_args, str(ROOT / "main.py"),
         ], cwd=ROOT, env=environment, check=True)
         bundle = staging / "dist" / APP_NAME
-        copy_notices(bundle, versions)
+        license_info = copy_notices(bundle, versions)
         for name in ("README.md", "使用说明.md", "THIRD-PARTY-NOTICES.md", "LICENSE"):
             source = ROOT / name
             if source.is_file():
@@ -162,6 +183,7 @@ def build(args: argparse.Namespace) -> Path:
         (bundle / "BUILD-INFO.json").write_text(json.dumps({
             "python": python_version, "platform": "Windows x64",
             "dependencies": versions, "browser_revisions": revisions,
+            **license_info,
         }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         validate_bundle(bundle)
         if output.exists():

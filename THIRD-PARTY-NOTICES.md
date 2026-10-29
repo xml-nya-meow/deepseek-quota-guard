@@ -4,7 +4,7 @@
 
 | 组件 | 锁定版本 | 上游 |
 | --- | --- | --- |
-| Python | 3.12.14 | https://www.python.org/ |
+| Python | 3.12.14 / 3.13.17，见产物清单 | https://www.python.org/ |
 | openpyxl | 3.1.5 | https://openpyxl.readthedocs.io/ |
 | defusedxml | 0.7.1 | https://github.com/tiran/defusedxml |
 | Playwright | 1.64.1 | https://playwright.dev/python/ |
@@ -13,6 +13,8 @@
 直接与传递依赖的完整版本以仓库根目录的 `requirements.lock` 为准。浏览器组件版本从已安装 Playwright 的清单解析；每次便携构建会在 `BUILD-INFO.json` 中记录 Python、依赖与浏览器 revision，不包含构建机器用户名或路径。
 
 本文件记录第三方组件与来源，不替代本项目自身的许可证。
+
+`third_party/tcl-8.6.12-license.terms` 来自 [Tcl core-8-6-12 原始许可](https://github.com/tcltk/tcl/blob/core-8-6-12/license.terms)，用于补齐该版本运行时可能缺少的许可原文。构建优先使用运行时附带许可，记录实际 Tcl 版本；其他 Tcl 版本缺少许可时会停止构建。
 
 公开资料用于确认边界或参考格式；未把下列项目整套代码移入程序，也未采用其读取浏览器令牌的方式。
 
