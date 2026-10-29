@@ -1,0 +1,192 @@
+"""Build a Windows portable candidate in a fresh staging directory."""
+from __future__ import annotations
+
+import argparse
+from importlib.metadata import PackageNotFoundError, distribution
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+ROOT = Path(__file__).resolve().parent
+APP_NAME = "额度管理"
+PYTHON_VERSION = "3.12.14"
+BROWSER_COMPONENTS = ("chromium", "ffmpeg", "winldd")
+
+
+def locked_dependencies() -> dict[str, str]:
+    versions = {}
+    for line in (ROOT / "requirements.lock").read_text(encoding="utf-8").splitlines():
+        requirement = line.split("#", 1)[0].strip()
+        if not requirement:
+            continue
+        match = re.fullmatch(r"([A-Za-z0-9_.-]+)==([A-Za-z0-9_.+!-]+)", requirement)
+        if not match:
+            raise RuntimeError("requirements.lock must contain exact package==version pins.")
+        name, expected = match.groups()
+        try:
+            actual = distribution(name).version
+        except PackageNotFoundError:
+            raise RuntimeError(f"Missing dependency: {name}. Install requirements.lock first.") from None
+        if actual != expected:
+            raise RuntimeError(f"Dependency mismatch: {name}; expected {expected}, found {actual}.")
+        versions[name] = actual
+    if not versions:
+        raise RuntimeError("requirements.lock is empty.")
+    return versions
+
+
+def browser_components(runtime: Path) -> tuple[list[Path], dict[str, str]]:
+    import playwright
+
+    package = Path(playwright.__file__).resolve().parent / "driver" / "package"
+    manifest = json.loads((package / "browsers.json").read_text(encoding="utf-8"))
+    entries = {item["name"]: item for item in manifest["browsers"]}
+    folders, revisions = [], {}
+    for name in BROWSER_COMPONENTS:
+        entry = entries[name]
+        revision = str(entry.get("revisionOverrides", {}).get("win64", entry["revision"]))
+        folder = runtime / f"{name.replace('-', '_')}-{revision}"
+        if not folder.is_dir() or not (folder / "INSTALLATION_COMPLETE").is_file():
+            raise RuntimeError(f"Browser component missing or incomplete: {folder.name}. "
+                               "Use --install-browser, or supply a matching --runtime directory.")
+        folders.append(folder)
+        revisions[name] = revision
+
+    # Ask the installed driver for its executable without launching a browser.
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as playwright_api:
+        executable = Path(playwright_api.chromium.executable_path).resolve()
+    if not executable.is_relative_to(folders[0].resolve()) or not executable.is_file():
+        raise RuntimeError("Chromium executable does not match the installed Playwright version.")
+    return folders, revisions
+
+
+def copy_notices(output: Path, versions: dict[str, str]) -> None:
+    notices = output / "第三方许可"
+    notices.mkdir()
+    for name in versions:
+        package = distribution(name)
+        for file in package.files or ():
+            parts = file.parts
+            metadata_index = next((i for i, part in enumerate(parts) if part.endswith(".dist-info")), None)
+            if metadata_index is None or not any(
+                part.lower().startswith(("license", "copying", "notice")) for part in parts
+            ):
+                continue
+            source = Path(package.locate_file(file))
+            if source.is_file():
+                target = notices / name / Path(*parts[metadata_index + 1:])
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+
+    for name in ("LICENSE.txt", "LICENSE"):
+        source = Path(sys.base_prefix) / name
+        if source.is_file():
+            shutil.copy2(source, notices / f"Python-{name}")
+    for source in (Path(sys.base_prefix) / "tcl").glob("*/license.terms"):
+        target = notices / source.parent.name / source.name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+
+    import playwright
+    driver = Path(playwright.__file__).resolve().parent / "driver"
+    for relative in ("LICENSE", "LICENSE.txt", "package/LICENSE", "package/NOTICE"):
+        source = driver / relative
+        if source.is_file():
+            target = notices / "Playwright-driver" / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+
+
+def validate_bundle(output: Path) -> None:
+    forbidden_names = {"管理设置.json", "人员额度.xlsx", "状态.db", ".运行锁",
+                       ".初始化中", "browser-smoke.json"}
+    forbidden_prefixes = ("运行日志-", "运行摘要-", "状态.db-")
+    for item in output.rglob("*"):
+        if item.name in forbidden_names or item.name.startswith(forbidden_prefixes):
+            raise RuntimeError("Build contains application data; the output was not published.")
+
+
+def build(args: argparse.Namespace) -> Path:
+    if sys.platform != "win32" or platform.machine().lower() not in {"amd64", "x86_64"}:
+        raise RuntimeError("The portable build requires Windows x64.")
+    if platform.python_version() != PYTHON_VERSION:
+        raise RuntimeError(f"Use Python {PYTHON_VERSION} to match the locked build environment.")
+    versions = locked_dependencies()
+    output = args.output.expanduser().resolve()
+    runtime = args.runtime.expanduser().resolve()
+    if output.exists():
+        raise RuntimeError("The output path already exists. Choose a new --output; nothing was overwritten.")
+    if output == runtime or output.is_relative_to(runtime) or runtime.is_relative_to(output):
+        raise RuntimeError("Output and browser runtime must be separate directories.")
+
+    environment = os.environ.copy()
+    environment["PLAYWRIGHT_BROWSERS_PATH"] = str(runtime)
+    environment["PYTHONHASHSEED"] = "0"
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(runtime)
+    if args.install_browser:
+        subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"],
+                       cwd=ROOT, env=environment, check=True)
+    components, revisions = browser_components(runtime)
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    # Only this unique child of the output parent is cleaned up afterwards.
+    with tempfile.TemporaryDirectory(prefix=".quota-build-", dir=output.parent) as temporary:
+        staging = Path(temporary).resolve()
+        if not staging.is_relative_to(output.parent) or staging == output.parent:
+            raise RuntimeError("Invalid staging directory.")
+        data_args = []
+        for component in components:
+            # runtime/.links contains development paths and is never copied.
+            data_args.extend(["--add-data", f"{component};browser-runtime/{component.name}"])
+        subprocess.run([
+            sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--windowed",
+            "--name", APP_NAME, "--distpath", str(staging / "dist"),
+            "--workpath", str(staging / "work"), "--specpath", str(staging / "spec"),
+            *data_args, str(ROOT / "main.py"),
+        ], cwd=ROOT, env=environment, check=True)
+        bundle = staging / "dist" / APP_NAME
+        copy_notices(bundle, versions)
+        for name in ("README.md", "使用说明.md", "THIRD-PARTY-NOTICES.md", "LICENSE"):
+            source = ROOT / name
+            if source.is_file():
+                shutil.copy2(source, bundle / name)
+        (bundle / "BUILD-INFO.json").write_text(json.dumps({
+            "python": PYTHON_VERSION, "platform": "Windows x64",
+            "dependencies": versions, "browser_revisions": revisions,
+        }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        validate_bundle(bundle)
+        if output.exists():
+            raise RuntimeError("The output path appeared during the build; nothing was overwritten.")
+        # Same-filesystem Windows rename fails if a racing destination exists.
+        bundle.rename(output)
+    return output
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, default=ROOT / "dist" / APP_NAME,
+                        help="New portable directory; an existing path is never overwritten")
+    parser.add_argument("--runtime", type=Path, default=ROOT / "browser-runtime",
+                        help="Playwright browser cache containing matching runtime components")
+    parser.add_argument("--install-browser", action="store_true",
+                        help="Download Chromium matching the installed Playwright version")
+    args = parser.parse_args()
+    try:
+        output = build(args)
+    except (RuntimeError, OSError, subprocess.CalledProcessError) as exc:
+        print(f"Build stopped: {exc}", file=sys.stderr)
+        return 1
+    print(f"Portable candidate created: {output}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
