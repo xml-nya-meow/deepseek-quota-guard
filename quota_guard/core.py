@@ -18,19 +18,25 @@ import sqlite3
 import tempfile
 from typing import Iterable
 from uuid import uuid4
-from zipfile import ZipFile
 
-from openpyxl import Workbook, load_workbook
+from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 from openpyxl.worksheet.datavalidation import DataValidation
 
 TZ = timezone(timedelta(hours=8))
 HEADERS = ("API名/人员名", "个人金额（元）")
 SCHEMA = 2
+_UNRESOLVED_ACTIONS = {"pending", "prepared", "requested", "unknown_result", "unknown", "failed", "confirmed",
+                       "observation_failed"}
+_LEGACY_READ_ONLY_INTENT = "用户请求只读核实平台状态；未授权或提交撤销"
 
 
 class GuardError(ValueError):
     """A readable validation/recovery error which must not trigger key deletion."""
+
+
+class AccountMismatch(GuardError):
+    """The caller may offer a separate ledger, never overwrite this account."""
 
 
 def money(value, *, allow_skip=False) -> Decimal:
@@ -178,10 +184,12 @@ class DataStore:
                 "start_date": config.start_date, "account_id": config.account_id,
                 "comparison": ">=", "share_rounding": "floor_yuan", "timezone": "UTC+08:00"}
 
-    def load(self) -> Config:
+    def load(self, *, require_workbook: bool = True) -> Config:
         if (self.folder / self.MARKER).exists():
             raise GuardError("检测到上次初始化中断，请恢复数据，不会自动清零。")
-        if not all(p.is_file() for p in (self.config_path, self.workbook_path, self.db_path)):
+        required_files = (self.config_path, self.db_path, self.workbook_path) if require_workbook else (
+            self.config_path, self.db_path)
+        if not all(p.is_file() for p in required_files):
             raise GuardError("设置、表格或统计文件缺失，请恢复原文件，不会自动新建周期。")
         try:
             raw = json.loads(self.config_path.read_text(encoding="utf-8"))
@@ -204,8 +212,8 @@ class DataStore:
                         continue
                     if stored.get(key) != str(value):
                         raise GuardError("设置与统计库不匹配，请恢复同一周期的一套文件。")
-                # Account identity changes exactly once, in the same SQLite
-                # transaction as the first bindings. Old nonempty JSON copies
+                # Account identity lives in SQLite, in the same transaction as
+                # binding or correcting an unused setup. Old nonempty JSON copies
                 # remain assertions; a blank JSON field is not a second store.
                 account = stored["account_id"]
                 if account != "":
@@ -274,44 +282,9 @@ class DataStore:
         return rows
 
     def read_people(self) -> list[Person]:
+        from .excel_io import read_people_workbook
         config = self.load()
-        if self.workbook_path.stat().st_size > 10 * 1024 * 1024:
-            raise GuardError("表格过大，请使用程序生成的两列表格。")
-        try:
-            with ZipFile(self.workbook_path) as archive:
-                entries = archive.infolist()
-                if len(entries) > 1000 or sum(e.file_size for e in entries) > 64 * 1024 * 1024:
-                    raise GuardError("表格解压内容过大，请使用程序生成的两列表格。")
-            wb = load_workbook(self.workbook_path, read_only=True, data_only=False, keep_links=False)
-            try:
-                if wb.sheetnames != ["人员额度"]:
-                    raise GuardError("表格只应有一个名为“人员额度”的工作表。")
-                ws = wb["人员额度"]
-                if ws.max_row > 20000 or ws.max_column > 2:
-                    raise GuardError("表格只能有规定的两列，且行数不能超过 20000。")
-                values = ws.iter_rows()
-                header = next(values, ())
-                if tuple(cell.value for cell in header) != HEADERS:
-                    raise GuardError("表头必须为“API名/人员名”和“个人金额（元）”。")
-                people = []
-                for number, row in enumerate(values, 2):
-                    cells = list(row)
-                    if any(c.data_type in ("f", "e") for c in cells):
-                        raise GuardError(f"第 {number} 行包含公式或错误值，请填写普通数字。")
-                    name, amount = cells[0].value, cells[1].value
-                    if name is None and amount is None:
-                        continue
-                    try:
-                        people.append(Person(clean_name(name), money(amount, allow_skip=True)))
-                    except GuardError as exc:
-                        raise GuardError(f"第 {number} 行：{exc}") from exc
-                return self._validate_people(people, config.people_count)
-            finally:
-                wb.close()
-        except GuardError:
-            raise
-        except Exception as exc:
-            raise GuardError("表格无法读取，请确认是完整保存的 .xlsx 文件。") from exc
+        return self._validate_people(read_people_workbook(self.workbook_path), config.people_count)
 
     def _write_workbook(self, people: list[Person]):
         wb = Workbook()
@@ -357,37 +330,289 @@ class DataStore:
                 "people": [{"name": p.name, "amount": str(p.amount)} for p in rows if p.name]})
         self.evaluate()
 
-    def active_bindings(self) -> list[dict]:
+    def recovery_workbook_hash(self) -> str | None:
+        """Distinguish a missing table from an unreadable/replaced file."""
+        try:
+            metadata = self.workbook_path.lstat()
+            if self.workbook_path.is_symlink() or getattr(metadata, "st_file_attributes", 0) & 0x400:
+                raise GuardError("人员表是链接或重解析文件，请先恢复本账本内的原始文件。")
+            return self.workbook_hash()
+        except FileNotFoundError:
+            return None
+
+    def restore_people(self, people: list[Person], *, expected_hash: str | None):
+        """Restore only an unusable workbook; never rebuild the ledger or fees."""
+        config = self.load(require_workbook=False)
+        rows = self._validate_people(people, config.people_count)
+        try:
+            self.read_people()
+        except GuardError:
+            pass
+        else:
+            raise GuardError("当前人员表已可正常读取，请重新检查，或使用普通导入。")
+        if self.recovery_workbook_hash() != expected_hash:
+            raise GuardError("人员表在确认期间发生变化，请重新选择并确认恢复。")
+        backup = None
+        if expected_hash is not None:
+            original = self.workbook_path.read_bytes()
+            if sha256(original).hexdigest() != expected_hash:
+                raise GuardError("人员表已改变，未覆盖文件。")
+            backup = self.folder / ("人员额度-恢复前-" + uuid4().hex + ".xlsx.bak")
+            with backup.open("xb") as stream:
+                stream.write(original)
+                stream.flush()
+                os.fsync(stream.fileno())
+        if self.load(require_workbook=False) != config or self.recovery_workbook_hash() != expected_hash:
+            raise GuardError("恢复期间设置或人员表已改变，未覆盖文件。")
+        self._write_workbook(rows)
+        with self._connect() as db:
+            self._event(db, "workbook_restored", {"previous_hash": expected_hash,
+                "workbook_hash": self.workbook_hash(), "backup": backup.name if backup else None})
+        self.export_logs()
+
+    def active_bindings(self, *, require_workbook: bool = True) -> list[dict]:
         """Persisted identities awaiting verified absence, including after restart.
 
         This is an expected set for reconciliation, not proof that a Key still
         exists. Callers must verify a surviving identity before retiring one.
         """
-        self.load()
+        self.load(require_workbook=require_workbook)
         with self._connect() as db:
             return [{"name": name, "tracking_id": key} for key, name in db.execute(
                 "SELECT tracking_id,person FROM bindings WHERE active=1 ORDER BY tracking_id")]
 
-    def active_tracking_ids(self) -> set[str]:
+    def active_tracking_ids(self, *, require_workbook: bool = True) -> set[str]:
         """Return identities not yet retired, without assuming they still exist."""
-        return {row["tracking_id"] for row in self.active_bindings()}
+        return {row["tracking_id"] for row in self.active_bindings(require_workbook=require_workbook)}
 
     def latest_action(self, tracking_id: str) -> str | None:
         """Latest persisted action status, across the complete event history."""
-        self.load()
+        record = self.latest_action_record(tracking_id)
+        return record["status"] if record is not None else None
+
+    @staticmethod
+    def _action_record(number: int, created: str, payload: str) -> dict:
+        record = {"id": number, "created": created, "kind": "action", **json.loads(payload)}
+        # Existing ledgers predate operation IDs; never invent an ID or evidence.
+        record.setdefault("operation_id", None)
+        return record
+
+    def latest_action_record(self, tracking_id: str) -> dict | None:
+        """Return the full latest action, including legacy and inherited records."""
+        self.load(require_workbook=False)
         key_id = _identifier(tracking_id)
         with self._connect() as db:
-            for (payload,) in db.execute("SELECT payload FROM events WHERE kind='action' ORDER BY id DESC"):
-                event = json.loads(payload)
+            for number, created, payload in db.execute(
+                    "SELECT id,created,payload FROM events WHERE kind='action' ORDER BY id DESC"):
+                event = self._action_record(number, created, payload)
                 if event.get("tracking_id") == key_id:
-                    return event["status"]
+                    return event
         return None
+
+    @classmethod
+    def _action_history(cls, db) -> list[dict]:
+        return [cls._action_record(number, created, payload) for number, created, payload in db.execute(
+            "SELECT id,created,payload FROM events WHERE kind='action' ORDER BY id")]
+
+    @staticmethod
+    def _operation_history(history: list[dict], action: dict) -> list[dict]:
+        return [event for event in history if event['tracking_id'] == action['tracking_id']
+                and event.get('operation_id') == action.get('operation_id')]
+
+    @staticmethod
+    def _read_only_operation(history: list[dict]) -> bool:
+        """Only an explicit read-only origin can discharge a presence observation.
+
+        Recognize the exact old UI-authored intent for existing ledgers, without
+        treating arbitrary detail text or missing submission events as evidence.
+        """
+        if not history or any('evidence' in event or event.get('requires_reconciliation') is True
+                              or event['status'] in {'prepared', 'requested', 'confirmed', 'not_submitted'}
+                              for event in history):
+            return False
+        first = history[0]
+        return (first.get('read_only') is True or
+                (first['status'] == 'pending' and first.get('operation_id') is not None
+                 and first.get('detail') == _LEGACY_READ_ONLY_INTENT))
+
+    @classmethod
+    def _unresolved_records(cls, history: list[dict]) -> list[dict]:
+        """Keep prior operations visible even after later presence observations."""
+        by_target = {}
+        for event in history:
+            by_target.setdefault(event['tracking_id'], []).append(event)
+        unresolved = []
+        for records in by_target.values():
+            # A verified absence settles earlier uncertainty about this exact
+            # target. A cancelled/read-only operation cannot settle another one.
+            cutoff = max((event['id'] for event in records if event['status'] == 'absent_verified'), default=-1)
+            operations = {}
+            for event in records:
+                if event['id'] > cutoff:
+                    operations.setdefault(event.get('operation_id'), []).append(event)
+            pending = []
+            for operation in operations.values():
+                latest = operation[-1]
+                if (latest['status'] in _UNRESOLVED_ACTIONS or
+                        (latest['status'] == 'present_verified' and not cls._read_only_operation(operation))):
+                    pending.append(latest)
+            if pending:
+                # One recovery row per target; preserve the original operation.
+                unresolved.append(max(pending, key=lambda event: event['id']))
+        return sorted(unresolved, key=lambda event: event['id'])
+
+    def unresolved_actions(self) -> list[dict]:
+        """Recover each target's last uncertain action without consulting people.
+
+        Removing or skipping a workbook row cannot remove its recovery duty.
+        Read all events rather than the bounded UI history window.
+        """
+        self.load(require_workbook=False)
+        with self._connect() as db:
+            return self._unresolved_records(self._action_history(db))
+
+    @staticmethod
+    def _can_correct_setup(db) -> bool:
+        return not db.execute("""SELECT
+            EXISTS(SELECT 1 FROM snapshots) OR EXISTS(SELECT 1 FROM costs) OR
+            EXISTS(SELECT 1 FROM events WHERE kind='action') OR
+            EXISTS(SELECT 1 FROM bindings WHERE active=0)""").fetchone()[0]
+
+    def can_correct_setup(self) -> bool:
+        """A binding is provisional only before any billing or action history."""
+        self.load()
+        with self._connect() as db:
+            return self._can_correct_setup(db)
+
+    def reset_initial_binding(self) -> Config:
+        """Correct an unused account binding while retaining the complete audit.
+
+        Callers must stop management and discard the old browser session first.
+        Even a zero-cost snapshot or an uncertain action prevents this reset.
+        """
+        config = self.load()
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not self._can_correct_setup(db):
+                raise GuardError("已有账目或处理记录，不能重置账户；请保留原账本并建立新账本。")
+            account = db.execute("SELECT value FROM meta WHERE key='account_id'").fetchone()[0]
+            bindings = [{"tracking_id": key, "name": name} for key, name in
+                        db.execute("SELECT tracking_id,person FROM bindings ORDER BY tracking_id")]
+            if account or bindings:
+                # Blank the legacy assertion first. If the transaction later
+                # rolls back, the old DB identity remains authoritative/readable.
+                raw = json.loads(self.config_path.read_text(encoding="utf-8"))
+                if raw.get("account_id", ""):
+                    raw["account_id"] = ""
+                    self._write_json(self.config_path, raw)
+                db.execute("DELETE FROM bindings")
+                db.execute("UPDATE meta SET value='' WHERE key='account_id'")
+                self._event(db, "initial_binding_reset", {"previous_account_id": account,
+                    "previous_bindings": bindings, "period_id": config.period_id})
+        self.export_logs()
+        return self.load()
+
+    def update_start_date(self, start_date: str, destination: Path) -> DataStore:
+        """Use a new ledger for a changed range; the original stays untouched."""
+        start = _date(start_date)
+        if start > datetime.now(TZ).date().isoformat():
+            raise GuardError("统计开始日期不能晚于今天。")
+        if start == self.load().start_date:
+            return self
+        return self.create_successor(destination, start, keep_account=True)
+
+    def create_successor(self, destination: Path, start_date: str | None = None,
+                         *, keep_account: bool = False) -> DataStore:
+        """Publish a complete new period without editing or moving the old one.
+
+        The UI supplies a fresh destination and switches only after this returns.
+        Same-account successors inherit identity and last action states, but no
+        costs or snapshots. Other-account successors have no inherited bindings.
+        """
+        config = self.load()
+        start = config.start_date if start_date is None else _date(start_date)
+        if start > datetime.now(TZ).date().isoformat():
+            raise GuardError("统计开始日期不能晚于今天。")
+        target = Path(destination).resolve()
+        if target.exists():
+            raise GuardError("新账本目录必须不存在，不能覆盖已有文件夹。")
+        fingerprint = self.workbook_hash()
+        people = self.read_people()
+        stage = None
+        try:
+            # Freeze the source's identity/actions while constructing its
+            # successor. Workbook edits are checked separately before publish.
+            with self._connect() as source_db:
+                source_db.execute("BEGIN IMMEDIATE")
+                if self.load() != config:
+                    raise GuardError("创建期间原账本设置发生变化，请重试。")
+                bindings = list(source_db.execute("SELECT tracking_id,person,active FROM bindings")) if keep_account else []
+                names = {key: name for key, name, _ in bindings}
+                actions = {}
+                if keep_account:
+                    history = self._action_history(source_db)
+                    blocked = {event['tracking_id']: event for event in self._unresolved_records(history)}
+                    for event in reversed(history):
+                        number, created = event['id'], event['created']
+                        action = {key: value for key, value in event.items() if key not in {'id', 'created', 'kind'}}
+                        key = action["tracking_id"]
+                        if key not in names or action["name"] != names[key]:
+                            raise GuardError("历史操作与绑定不一致，不能安全建立新周期。")
+                        if key not in actions:
+                            if key in blocked:
+                                event = blocked[key]
+                                number, created = event['id'], event['created']
+                                action = {field: value for field, value in event.items()
+                                          if field not in {'id', 'created', 'kind'}}
+                            operation = self._operation_history(history, action)
+                            if self._read_only_operation(operation):
+                                action['read_only'] = True
+                            elif action['status'] == 'present_verified':
+                                action['requires_reconciliation'] = True
+                            actions[key] = {**action, "inherited_from_period": config.period_id,
+                                            "original_event_id": number, "original_created": created}
+                target.parent.mkdir(parents=True, exist_ok=True)
+                stage = Path(tempfile.mkdtemp(prefix=".new-ledger-", dir=target.parent)).resolve()
+                successor = DataStore(stage)
+                successor.initialize(config.people_count, config.total_budget, start)
+                with successor._connect() as new_db:
+                    new_db.execute("BEGIN IMMEDIATE")
+                    if keep_account:
+                        new_db.execute("UPDATE meta SET value=? WHERE key='account_id'", (config.account_id,))
+                        new_db.executemany("INSERT INTO bindings VALUES (?,?,?)", bindings)
+                        for action in sorted(actions.values(), key=lambda value: value["original_event_id"]):
+                            self._event(new_db, "action", action)
+                    self._event(new_db, "successor_created", {"previous_period_id": config.period_id,
+                        "previous_folder": str(self.folder), "previous_start_date": config.start_date,
+                        "start_date": start, "keep_account": keep_account,
+                        "inherited_binding_count": len(bindings), "inherited_action_count": len(actions)})
+                successor.save_people(people)
+                successor.load()
+                if self.workbook_hash() != fingerprint or self.load() != config:
+                    raise GuardError("创建期间原账本或人员表发生变化，新账本未启用，请重试。")
+                if target.exists():
+                    raise GuardError("新账本目录已被其他操作创建，未覆盖。")
+                # Both paths are explicitly resolved siblings under the chosen
+                # parent; only the newly created staging directory is renamed.
+                if stage.parent != target.parent or stage == self.folder:
+                    raise GuardError("新账本暂存目录无效，未移动任何原数据。")
+                stage.rename(target)
+            return DataStore(target)
+        except Exception as exc:
+            if stage is not None and stage.is_dir():
+                try:
+                    (stage / self.MARKER).write_text("后继账本创建中断；原账本未修改。", encoding="utf-8")
+                except OSError:
+                    pass
+            if isinstance(exc, GuardError):
+                raise
+            raise GuardError("新账本创建未完成，原账本仍保留且未修改，请检查目录权限后重试。") from exc
 
     def bind_keys(self, keys: list[dict], account_id: str):
         config = self.load()
         account = _identifier(account_id)
         if config.account_id and account != config.account_id:
-            raise GuardError("登录账户与此数据目录不一致，拒绝绑定。")
+            raise AccountMismatch("登录账户与此数据目录不一致；请登录原账户，或保留原账本并建立新账本。")
         people = [p for p in self.read_people() if p.amount >= 0]
         by_name: dict[str, list[str]] = {}
         seen_ids = set()
@@ -466,7 +691,13 @@ class DataStore:
                 db.execute("INSERT INTO snapshots VALUES (?,?,?,?,?)", (source, digest, start, end, _now()))
                 self._event(db, "snapshot", {"source_id": source, "start_date": start,
                     "end_date": end, "tracked_key_count": len(received),
-                    "missing_key_count": len(required - received)})
+                    "missing_key_count": len(required - received),
+                    # This versions our audit representation, not a public API contract.
+                    "schema_version": 1, "timezone": "UTC+08:00", "currency": "CNY",
+                    "totals": {key: format(normalized[key], "f") for key in sorted(received)},
+                    "coverage": {"scope": "bound_keys", "complete": required == received,
+                                 "missing_tracking_ids": sorted(required - received),
+                                 "missing_cost": "unknown"}})
             # Costs and their trigger events commit together. Replaying an old
             # source still reconciles events against the current workbook.
             results = self._evaluate(db, config, people)
@@ -546,21 +777,166 @@ class DataStore:
             results.append(result)
         return results
 
-    def record_action(self, name: str, tracking_id: str, status: str, detail: str):
-        self.load()
+    def action_evidence(self, name: str, tracking_id: str) -> dict:
+        """Capture the current rule and cost basis using a fixed non-secret schema."""
+        config = self.load()
+        name, key_id = clean_name(name), _identifier(tracking_id)
+        fingerprint = self.workbook_hash()
+        people = self.read_people()
+        with self._connect() as db:
+            db.execute("BEGIN")
+            bound = db.execute("SELECT person FROM bindings WHERE tracking_id=?", (key_id,)).fetchone()
+            if not bound or bound[0] != name:
+                raise GuardError("操作证据目标与既有绑定不一致。")
+            row = next((item for item in self._evaluate(db, config, people) if item["name"] == name), None)
+            if row is None or row["tracking_id"] != key_id:
+                raise GuardError("当前人员表或活动 Key 不支持此操作目标，请重新核对。")
+            latest = db.execute("SELECT source_id FROM snapshots ORDER BY rowid DESC LIMIT 1").fetchone()
+            evidence = {"period_id": config.period_id, "account_id": config.account_id,
+                "workbook_hash": fingerprint, "amount": format(row["amount"], "f"),
+                "share": format(row["share"], "f"),
+                "spent": format(row["spent"], "f") if row["spent"] is not None else None,
+                "reasons": list(row["reasons"]), "snapshot_id": latest[0] if latest else None,
+                "complete": row["complete"], "status": row["status"]}
+        if self.workbook_hash() != fingerprint or self.load() != config:
+            raise GuardError("读取操作证据期间设置或人员表发生变化，请重新核对。")
+        return evidence
+
+    @staticmethod
+    def _validated_action_evidence(evidence: dict) -> dict:
+        allowed = {"period_id", "account_id", "workbook_hash", "amount", "share", "spent",
+                   "reasons", "snapshot_id", "complete", "status"}
+        if not isinstance(evidence, dict) or set(evidence) != allowed:
+            raise GuardError("操作证据字段不完整或包含不支持的内容。")
+        result = {}
+        for key in ("period_id", "account_id", "snapshot_id"):
+            value = evidence[key]
+            if key == "snapshot_id" and value is None:
+                result[key] = None
+            else:
+                value = _identifier(value)
+                if _safe_detail(value) != value:
+                    raise GuardError("操作证据不能包含认证信息。")
+                result[key] = value
+        fingerprint = evidence["workbook_hash"]
+        if not isinstance(fingerprint, str) or not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+            raise GuardError("操作证据缺少有效的人员表指纹。")
+        result["workbook_hash"] = fingerprint
+        result["amount"] = format(money(evidence["amount"], allow_skip=True), "f")
+        result["share"] = format(money(evidence["share"]), "f")
+        result["spent"] = None if evidence["spent"] is None else format(money(evidence["spent"]), "f")
+        reasons = evidence["reasons"]
+        known_reasons = {"个人额度为零", "公共人均额度为零", "达到个人额度", "达到公共人均额度",
+            "尚未完成 Key 绑定或缺少完整周期账单",
+            "最近费用快照缺少该人员部分记录，历史金额仅为已知下界",
+            "已核实平台列表中不存在，保留历史费用；不据此认定删除原因"}
+        if (not isinstance(reasons, list) or len(reasons) > 4
+                or any(not isinstance(reason, str) or reason not in known_reasons for reason in reasons)):
+            raise GuardError("操作证据包含不支持的判断原因。")
+        if (type(evidence["complete"]) is not bool or not isinstance(evidence["status"], str)
+                or evidence["status"] not in {"ok", "skipped", "retired", "triggered", "unknown"}):
+            raise GuardError("操作证据的数据状态无效。")
+        result.update(reasons=list(reasons), complete=evidence["complete"], status=evidence["status"])
+        return result
+
+    def record_action(self, name: str, tracking_id: str, status: str, detail: str, *,
+                      operation_id: str | None = None, evidence: dict | None = None,
+                      continuation: bool = False, read_only: bool = False):
+        # Only the outcome of an existing operation can bypass the workbook.
+        # New intents/approval and new evidence always require a valid table.
+        self.load(require_workbook=not continuation)
+        if continuation:
+            if status in {"pending", "requested"} or evidence is not None:
+                raise GuardError("恢复只允许记录原操作结果，不能建立新撤销意图、许可或费用依据。")
+        else:
+            self.read_people()
         name, key_id = clean_name(name), _identifier(tracking_id)
         if status not in {"pending", "prepared", "unknown_result", "absent_verified",
-                          "requested", "confirmed", "failed", "unknown", "cancelled"}:
+                          "requested", "confirmed", "failed", "unknown", "cancelled", "present_verified", "not_submitted",
+                          "observation_failed"}:
             raise GuardError("无效的操作状态。")
+        if type(read_only) is not bool or (read_only and
+                (status != 'pending' or continuation or evidence is not None or operation_id is None)):
+            raise GuardError("只读标记仅用于无撤销证据的新核实起点。")
+        if status == 'not_submitted' and (not continuation or operation_id is None):
+            raise GuardError("未提交结论只允许延续有编号的新准备操作。")
+        if status == 'observation_failed' and not continuation:
+            raise GuardError("只读观察失败只能续记已有待核实操作。")
+        if operation_id is not None:
+            operation_id = _identifier(operation_id)
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", operation_id):
+                raise GuardError("操作编号无效。")
+        payload = {"name": name, "tracking_id": key_id, "status": status, "detail": _safe_detail(detail)}
+        if operation_id is not None:
+            payload["operation_id"] = operation_id
+        if evidence is not None:
+            payload["evidence"] = self._validated_action_evidence(evidence)
+        if read_only:
+            payload['read_only'] = True
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             bound = db.execute("SELECT person FROM bindings WHERE tracking_id=?", (key_id,)).fetchone()
             if not bound or bound[0] != name:
                 raise GuardError("操作目标与既有绑定不一致，拒绝记录成功。")
+            history = self._action_history(db)
+            operation = self._operation_history(history, payload)
+            if read_only and operation:
+                raise GuardError("不能把已有操作重新标记为只读核实。")
+            if status == 'pending':
+                for blocked in self._unresolved_records(history):
+                    if blocked['tracking_id'] == key_id and not (
+                            blocked.get('operation_id') == operation_id and blocked['status'] == 'pending'):
+                        raise GuardError("原操作仍可能提交或结果未知，不能建立新的处理意图。")
+            if self._read_only_operation(operation):
+                if status in {'prepared', 'requested', 'confirmed', 'not_submitted'} or evidence is not None:
+                    raise GuardError("只读核实不能转为撤销或签发许可。")
+                payload['read_only'] = True
+            if continuation:
+                previous = operation[-1] if operation else None
+                if (previous is None or previous.get("name") != name
+                        or previous.get("operation_id") != operation_id):
+                    raise GuardError("未找到同一目标的原操作，不能通过恢复入口新增或替换操作。")
+                presence_continuation = (previous.get('status') == 'present_verified'
+                                         and not self._read_only_operation(operation)
+                                         and status in {'present_verified', 'absent_verified', 'observation_failed'})
+                if previous.get("status") not in _UNRESOLVED_ACTIONS | {status} and not presence_continuation:
+                    raise GuardError("原操作已核实结束，不能用迟到结果改写结论。")
+                if status == 'not_submitted' and (previous['status'] not in {'pending', 'not_submitted'} or
+                        any(event['status'] not in {'pending', 'not_submitted'} for event in operation)):
+                    raise GuardError("不能将曾经可能提交或观察过的操作回填为未提交。")
+                if "evidence" in previous:
+                    payload["evidence"] = self._validated_action_evidence(previous["evidence"])
+            if operation_id is not None:
+                for (previous,) in db.execute("SELECT payload FROM events WHERE kind='action' ORDER BY id DESC"):
+                    action = json.loads(previous)
+                    if action.get("operation_id") != operation_id:
+                        continue
+                    if action.get("name") != name or action.get("tracking_id") != key_id:
+                        raise GuardError("操作编号已关联其他目标，拒绝混用处理记录。")
+                    if "evidence" not in payload and "evidence" in action:
+                        # Late results keep their original approved basis even if
+                        # the workbook changed or a successor ledger was opened.
+                        payload["evidence"] = self._validated_action_evidence(action["evidence"])
+            if status == 'present_verified' and not self._read_only_operation(operation):
+                payload['requires_reconciliation'] = True
+            replay_not_submitted = False
+            if status == 'not_submitted':
+                recorded = [event for event in operation if event['status'] == 'not_submitted']
+                if recorded:
+                    # SQLite may have committed before the text-log export
+                    # failed. Replay that exact result by exporting again,
+                    # never by inserting a second result or clearing other duty.
+                    def original_payload(event):
+                        return {key: value for key, value in event.items()
+                                if key not in {'id', 'created', 'kind'}}
+                    if (operation[-1]['status'] != 'not_submitted'
+                            or any(original_payload(event) != payload for event in recorded)):
+                        raise GuardError("已有未提交结论与本次重试不一致，未改写原操作。")
+                    replay_not_submitted = True
             if status == "absent_verified":
                 db.execute("UPDATE bindings SET active=0 WHERE tracking_id=?", (key_id,))
-            self._event(db, "action", {"name": name, "tracking_id": key_id,
-                "status": status, "detail": _safe_detail(detail)})
+            if not replay_not_submitted:
+                self._event(db, "action", payload)
         self.export_logs()
 
     @staticmethod
@@ -569,7 +945,7 @@ class DataStore:
                    (dedup, _now(), kind, json.dumps(payload, ensure_ascii=False)))
 
     def events(self, limit: int = 200) -> list[dict]:
-        self.load()
+        self.load(require_workbook=False)
         with self._connect() as db:
             rows = db.execute("SELECT id,created,kind,payload FROM events ORDER BY id DESC LIMIT ?",
                               (max(1, min(int(limit), 10000)),)).fetchall()

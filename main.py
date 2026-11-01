@@ -13,28 +13,48 @@ def main():
     parser.add_argument('--browser-smoke', action='store_true', help='Check bundled Chromium using about:blank only')
     args = parser.parse_args()
     base = Path(sys.executable).parent if getattr(sys, 'frozen', False) else Path(__file__).parent.parent
-    folder = args.data_dir or base
+    home = (args.data_dir or base).resolve()
+    folder = home
     if args.browser_smoke:
-        from quota_guard.browser_service import BrowserService
-        folder.mkdir(parents=True, exist_ok=True)
-        browser = BrowserService()
+        from quota_guard.browser_process import IsolatedBrowserService as BrowserService
+        browser = None
+        result = {'browser_started': False, 'reason_code': 'BROWSER_SMOKE_FAILED'}
         try:
+            folder.mkdir(parents=True, exist_ok=True)
+            browser = BrowserService(diagnostics_dir=folder / '临时诊断日志')
             result = browser.submit('selftest').result(timeout=45)
-            (folder / 'browser-smoke.json').write_text(json.dumps(result), encoding='utf-8')
+        except Exception:
+            # Windowed self-tests must exit without an exception dialog.
+            # SDK exceptions can contain credentials and must not be serialized.
+            result = {'browser_started': False, 'reason_code': 'BROWSER_SMOKE_FAILED'}
         finally:
-            browser.close()
-        return
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    result = {'browser_started': False, 'reason_code': 'BROWSER_SMOKE_CLEANUP_FAILED'}
+        try:
+            (folder / 'browser-smoke.json').write_text(json.dumps(result), encoding='utf-8')
+        except OSError:
+            return 1
+        return 0 if result.get('browser_started') is True else 1
     root = tk.Tk()
     try:
         from quota_guard.ui import App
-        app = App(root, folder)
+        from quota_guard.workspace import current_ledger
+        folder = current_ledger(home)
+        app = App(root, folder, home_folder=home)
         if args.smoke:
             root.after(1500, app.close)
         root.mainloop()
-    except Exception:
-        messagebox.showerror('启动未完成', '程序启动失败。请确认文件夹完整、目录可写且没有其他实例；保留数据文件，请勿清空统计。')
+    except Exception as exc:
+        from quota_guard.core import GuardError
+        detail = str(exc) if isinstance(exc, GuardError) else '请确认文件夹完整、目录可写且没有其他实例；保留数据文件，请勿清空统计。'
+        messagebox.showerror('启动未完成', detail)
         root.destroy()
         raise
 
 if __name__ == '__main__':
-    main()
+    from multiprocessing import freeze_support
+    freeze_support()
+    raise SystemExit(main())

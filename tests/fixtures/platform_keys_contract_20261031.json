@@ -1,0 +1,33 @@
+{
+  "provenance": {
+    "source_url": "https://fe-static.deepseek.com/platform/static/4179.a95866c86d.js",
+    "sha256": "7c92bdb484b6bfc54aee93723f1b35915447434d0628fafb064fc4a1706d5bc1",
+    "basis": "Public static request/field mappers only. All identities, names, dates and response envelopes below are synthetic; no live server success response was observed."
+  },
+  "list_method": "GET",
+  "list_url": "https://platform.deepseek.com/api/v0/users/get_api_keys",
+  "list_response": {
+    "code": 0,
+    "data": {
+      "biz_code": 0,
+      "biz_data": {
+        "api_keys": [
+          {"name": "Fixture target", "tracking_id": "00000000-0000-0000-0000-000000000001", "sensitive_id": "sk-alpha*****0001", "created_at": 1793203200, "last_use": null, "key_type": "USER", "is_exp": false},
+          {"name": "Fixture target", "tracking_id": "00000000-0000-0000-0000-000000000002", "sensitive_id": "sk-bravo*****0002", "created_at": 1793203201, "last_use": null, "key_type": "USER", "is_exp": false},
+          {"name": "Fixture survivor", "tracking_id": "00000000-0000-0000-0000-000000000003", "sensitive_id": "sk-charlie*****0003", "created_at": 1793203202, "last_use": null, "key_type": "USER", "is_exp": false}
+        ],
+        "key_quota": {}
+      }
+    }
+  },
+  "delete_method": "POST",
+  "delete_url": "https://platform.deepseek.com/api/v0/users/edit_api_keys",
+  "delete_body": {
+    "action": "delete",
+    "name": null,
+    "redacted_key": "sk-alpha*****0001",
+    "created_at": 1793203200,
+    "tracking_id": "00000000-0000-0000-0000-000000000001"
+  },
+  "synthetic_delete_response": {"code": 0, "data": {"biz_code": 0, "biz_data": null}}
+}

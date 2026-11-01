@@ -127,7 +127,7 @@ def copy_notices(output: Path, versions: dict[str, str]) -> dict[str, str]:
 
 
 def validate_bundle(output: Path) -> None:
-    forbidden_names = {"管理设置.json", "人员额度.xlsx", "状态.db", ".运行锁",
+    forbidden_names = {"管理设置.json", "当前账本.json", "账本", "人员额度.xlsx", "状态.db", ".运行锁",
                        ".初始化中", "browser-smoke.json"}
     forbidden_prefixes = ("运行日志-", "运行摘要-", "状态.db-")
     for item in output.rglob("*"):
@@ -164,7 +164,10 @@ def build(args: argparse.Namespace) -> Path:
         staging = Path(temporary).resolve()
         if not staging.is_relative_to(output.parent) or staging == output.parent:
             raise RuntimeError("Invalid staging directory.")
-        data_args = []
+        template = ROOT / "templates" / "人员额度模板.xlsx"
+        if not template.is_file():
+            raise RuntimeError("The personnel workbook template is missing.")
+        data_args = ["--add-data", f"{template};templates"]
         for component in components:
             # runtime/.links contains development paths and is never copied.
             data_args.extend(["--add-data", f"{component};browser-runtime/{component.name}"])
@@ -176,11 +179,18 @@ def build(args: argparse.Namespace) -> Path:
         ], cwd=ROOT, env=environment, check=True)
         bundle = staging / "dist" / APP_NAME
         license_info = copy_notices(bundle, versions)
-        for name in ("README.md", "使用说明.md", "THIRD-PARTY-NOTICES.md", "LICENSE"):
+        (bundle / "templates").mkdir()
+        shutil.copy2(template, bundle / "templates" / template.name)
+        for name in ("README.md", "使用说明.md", "验证计划.md", "THIRD-PARTY-NOTICES.md", "LICENSE"):
             source = ROOT / name
             if source.is_file():
                 shutil.copy2(source, bundle / name)
+        for source in sorted((ROOT / "docs").glob("*.md")):
+            if source.is_file():
+                (bundle / "docs").mkdir(exist_ok=True)
+                shutil.copy2(source, bundle / "docs" / source.name)
         (bundle / "BUILD-INFO.json").write_text(json.dumps({
+            "application_version": __import__('quota_guard').__version__,
             "python": python_version, "platform": "Windows x64",
             "dependencies": versions, "browser_revisions": revisions,
             **license_info,

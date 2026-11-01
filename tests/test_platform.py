@@ -4,7 +4,7 @@ from decimal import Decimal
 from pathlib import Path
 import tempfile
 import unittest
-from quota_guard.browser_service import parse_cost_response
+from quota_guard.browser_service import parse_cost_response, cost_query_matches
 from quota_guard.billing import HEADERS, inspect_export
 from quota_guard.core import GuardError
 from quota_guard.instance import FolderLock
@@ -18,6 +18,11 @@ class PlatformTests(unittest.TestCase):
         return parse_cost_response(payload or self.payload,url or self.url,'2026-10-29','2026-10-29')
     def test_exact_money(self):
         self.assertEqual(self.parse(), {'fixture-key-001':Decimal('107.000001')})
+    def test_cost_reply_must_match_selected_date_window(self):
+        self.assertTrue(cost_query_matches(self.url, '2026-10-29', '2026-10-29'))
+        self.assertFalse(cost_query_matches(self.url, '2026-10-28', '2026-10-29'))
+        self.assertFalse(cost_query_matches(self.url + '&start=0', '2026-10-29', '2026-10-29'))
+        self.assertFalse(cost_query_matches(self.url.replace('https:', 'http:'), '2026-10-29', '2026-10-29'))
     def test_unknown_empty_not_zero(self):
         self.payload['data']['biz_data']['data'] = []
         with self.assertRaises(GuardError): self.parse()

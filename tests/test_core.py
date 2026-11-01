@@ -1,5 +1,5 @@
 from contextlib import closing
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 import json
@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from openpyxl import load_workbook
-from quota_guard.core import Config, DataStore, GuardError, Person, TZ, money
+from quota_guard.core import AccountMismatch, Config, DataStore, GuardError, Person, TZ, money
 
 
 class CoreTests(unittest.TestCase):
@@ -79,6 +79,45 @@ class CoreTests(unittest.TestCase):
             with self.assertRaises(GuardError):
                 self.snapshot(totals, source)
         self.assertEqual(self.store.evaluate()[0]["spent"], Decimal(50))
+
+    def test_snapshot_audit_keeps_exact_received_amounts_and_missing_keys(self):
+        self.people(("甲", 80), ("乙", 80))
+        self.bind("甲", "乙")
+        self.store.apply_snapshot({"id-甲": Decimal("0.009600000000000001"),
+                                   "unbound-key": Decimal("999")}, "first", self.start, self.start)
+        self.snapshot({"甲": "0.009700000000000001", "乙": 0}, "second")
+        events = {event["source_id"]: event for event in self.store.events() if event["kind"] == "snapshot"}
+        first, second = events["first"], events["second"]
+        self.assertEqual(first["totals"], {"id-甲": "0.009600000000000001"})
+        self.assertEqual(second["totals"], {"id-甲": "0.009700000000000001", "id-乙": "0"})
+        self.assertEqual(first["timezone"], "UTC+08:00")
+        self.assertEqual(first["currency"], "CNY")
+        self.assertEqual(first["schema_version"], 1)
+        self.assertEqual(first["coverage"], {"scope": "bound_keys", "complete": False,
+            "missing_tracking_ids": ["id-乙"], "missing_cost": "unknown"})
+        self.assertTrue(second["coverage"]["complete"])
+        restored = DataStore(self.folder)
+        self.assertEqual(next(e for e in restored.events() if e.get("source_id") == "first")["totals"],
+                         first["totals"])
+        before = [e for e in restored.events() if e["kind"] == "snapshot"]
+        with self.assertRaises(GuardError):
+            self.snapshot({"甲": "0.0096"}, "decreased")
+        self.assertEqual([e for e in restored.events() if e["kind"] == "snapshot"], before)
+
+    def test_legacy_snapshot_replay_does_not_invent_historical_evidence(self):
+        self.people(("甲", 80))
+        self.bind("甲")
+        self.snapshot({"甲": 50})
+        with self.store._connect() as db:
+            number, payload = db.execute("SELECT id,payload FROM events WHERE kind='snapshot'").fetchone()
+            legacy = json.loads(payload)
+            for field in ("totals", "timezone", "currency", "schema_version", "coverage"):
+                legacy.pop(field)
+            db.execute("UPDATE events SET payload=? WHERE id=?", (json.dumps(legacy), number))
+        self.snapshot({"甲": 50})
+        events = [event for event in self.store.events() if event["kind"] == "snapshot"]
+        self.assertEqual(len(events), 1)
+        self.assertNotIn("totals", events[0])
 
     def test_wrong_period_rejected(self):
         self.people(("甲", 80))
@@ -348,6 +387,122 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(restored.active_bindings(), [{"name": "乙", "tracking_id": "id-乙"}])
         self.assertIsNone(restored.latest_action("never-bound"))
 
+    def test_action_evidence_preserves_current_rule_and_exact_snapshot_basis(self):
+        self.people(("甲", "0.01"), ("乙", 80))
+        self.bind("甲", "乙")
+        self.snapshot({"甲": "0.010000000000000001", "乙": 20})
+        config = self.store.load()
+        evidence = self.store.action_evidence("甲", "id-甲")
+        self.assertEqual(evidence, {"period_id": config.period_id, "account_id": "account-test",
+            "workbook_hash": self.store.workbook_hash(), "amount": "0.01", "share": "107",
+            "spent": "0.010000000000000001", "reasons": ["达到个人额度"],
+            "snapshot_id": "sample", "complete": True, "status": "triggered"})
+        self.snapshot({"乙": 21}, "partial")
+        partial = self.store.action_evidence("甲", "id-甲")
+        self.assertFalse(partial["complete"])
+        self.assertEqual(partial["snapshot_id"], "partial")
+        self.assertEqual(partial["spent"], evidence["spent"])
+        self.assertEqual(partial["status"], "triggered")
+
+    def test_zero_action_evidence_needs_no_cost_snapshot_and_detects_changed_workbook(self):
+        self.people(("甲", 0))
+        self.bind("甲")
+        evidence = self.store.action_evidence("甲", "id-甲")
+        self.assertIsNone(evidence["snapshot_id"])
+        self.assertIsNone(evidence["spent"])
+        self.assertFalse(evidence["complete"])
+        self.assertEqual(evidence["reasons"], ["个人额度为零"])
+        with self.assertRaises(GuardError):
+            self.store.action_evidence("乙", "id-甲")
+        original_hash = self.store.workbook_hash()
+        with patch.object(self.store, "workbook_hash", side_effect=[original_hash, "0" * 64]):
+            with self.assertRaises(GuardError):
+                self.store.action_evidence("甲", "id-甲")
+
+    def test_operation_id_is_bound_to_one_target_and_full_record_survives_restart(self):
+        self.people(("甲", 0), ("乙", 0))
+        self.bind("甲", "乙")
+        evidence = self.store.action_evidence("甲", "id-甲")
+        self.store.record_action("甲", "id-甲", "pending", "待处理", operation_id="operation-a", evidence=evidence)
+        self.store.record_action("甲", "id-甲", "requested", "已批准", operation_id="operation-a", evidence=evidence)
+        with self.assertRaises(GuardError):
+            self.store.record_action("乙", "id-乙", "absent_verified", "错误复用", operation_id="operation-a")
+        self.assertEqual(self.store.active_tracking_ids(), {"id-甲", "id-乙"})
+        restored = DataStore(self.folder)
+        record = restored.latest_action_record("id-甲")
+        self.assertEqual(record["operation_id"], "operation-a")
+        self.assertEqual(record["evidence"], evidence)
+        self.assertEqual(record["name"], "甲")
+        self.assertEqual(record["tracking_id"], "id-甲")
+        self.assertEqual(record["status"], "requested")
+        self.assertEqual(record["kind"], "action")
+        self.assertIsInstance(record["id"], int)
+        self.assertTrue(record["created"])
+        self.assertEqual(restored.latest_action("id-甲"), record["status"])
+        self.assertIsNone(restored.latest_action_record("never-bound"))
+        restored.record_action("甲", "id-甲", "unknown_result", "结果待核实", operation_id="operation-a")
+        self.assertEqual(restored.latest_action_record("id-甲")["evidence"], evidence)
+        with self.assertRaises(GuardError):
+            restored.record_action("甲", "id-甲", "pending", "不得越过旧操作", operation_id="operation-new")
+        self.assertEqual(restored.latest_action_record("id-甲")["operation_id"], "operation-a")
+
+    def test_legacy_action_record_has_no_invented_operation_or_evidence(self):
+        self.people(("甲", 0))
+        self.bind("甲")
+        self.store.record_action("甲", "id-甲", "requested", "旧记录")
+        record = self.store.latest_action_record("id-甲")
+        self.assertIsNone(record["operation_id"])
+        self.assertNotIn("evidence", record)
+        self.assertEqual(self.store.unresolved_actions(), [record])
+
+    def test_unresolved_actions_uses_all_history_and_ignores_current_workbook_rows(self):
+        states = ("pending", "requested", "unknown_result", "unknown", "failed", "prepared", "confirmed")
+        names = [f"人员{i}" for i in range(len(states))]
+        self.people(*[(name, 0) for name in names])
+        self.bind(*names)
+        for name, state in zip(names, states):
+            self.store.record_action(name, f"id-{name}", state, "等待核验", operation_id=f"operation-{state}")
+        self.people((names[0], -1))
+        with self.store._connect() as db:
+            for index in range(210):
+                self.store._event(db, "synthetic_later_event", {"number": index})
+        self.store.workbook_path.write_bytes(b"unreadable workbook must not hide recovery records")
+        restored = DataStore(self.folder)
+        records = restored.unresolved_actions()
+        self.assertEqual([record["status"] for record in records], list(states))
+        self.assertEqual({record["name"] for record in records}, set(names))
+        self.assertTrue(all(record["operation_id"] for record in records))
+        self.store.workbook_path.unlink()
+        self.assertEqual(restored.unresolved_actions(), records)
+        self.assertEqual(restored.latest_action_record(f"id-{names[0]}"), records[0])
+        with self.assertRaises(GuardError):
+            restored.load()
+
+    def test_present_verified_keeps_uncertainty_without_retiring_or_calling_it_cancelled(self):
+        self.people(("甲", 0), ("乙", 0))
+        self.bind("甲", "乙")
+        self.store.record_action("甲", "id-甲", "unknown_result", "结果待核验", operation_id="a")
+        self.store.record_action("乙", "id-乙", "pending", "尚未发许可", operation_id="b")
+        self.store.record_action("甲", "id-甲", "present_verified", "仍在平台列表", operation_id="a")
+        self.store.record_action("乙", "id-乙", "cancelled", "许可前取消", operation_id="b")
+        self.assertEqual(self.store.unresolved_actions(), [self.store.latest_action_record("id-甲")])
+        self.assertEqual(self.store.latest_action("id-甲"), "present_verified")
+        self.assertEqual(self.store.latest_action("id-乙"), "cancelled")
+        self.assertEqual(self.store.active_tracking_ids(), {"id-甲", "id-乙"})
+
+    def test_action_evidence_rejects_unknown_or_secret_fields_before_writing(self):
+        self.people(("甲", 0))
+        self.bind("甲")
+        evidence = self.store.action_evidence("甲", "id-甲")
+        invalid = [dict(evidence, cookie="not-allowed"), dict(evidence, spent="NaN"),
+                   dict(evidence, complete=1), dict(evidence, reasons=["Bearer credential"]),
+                   dict(evidence, status={"unexpected": True})]
+        for value in invalid:
+            with self.subTest(fields=sorted(value)):
+                with self.assertRaises(GuardError):
+                    self.store.record_action("甲", "id-甲", "pending", "invalid", operation_id="a", evidence=value)
+        self.assertIsNone(self.store.latest_action("id-甲"))
+
     def test_orphan_sqlite_sidecars_prevent_reinitialization(self):
         for suffix in ("-wal", "-shm"):
             with self.subTest(suffix=suffix):
@@ -360,6 +515,175 @@ class CoreTests(unittest.TestCase):
                 with self.assertRaises(GuardError):
                     other.initialize(14, "1500", self.start)
                 self.assertEqual(artifact.read_bytes(), b"preserved history")
+
+    def test_initial_wrong_binding_can_be_reset_without_losing_audit(self):
+        self.people(("甲", 0))
+        self.bind("甲")
+        original = self.store.load()
+        workbook = self.store.workbook_path.read_bytes()
+        # Older installations also asserted the account in their JSON file.
+        raw = json.loads(self.store.config_path.read_text(encoding="utf-8"))
+        raw["account_id"] = original.account_id
+        self.store.config_path.write_text(json.dumps(raw), encoding="utf-8")
+        self.assertTrue(self.store.can_correct_setup())
+        reset = self.store.reset_initial_binding()
+        self.assertEqual(reset.period_id, original.period_id)
+        self.assertEqual(reset.account_id, "")
+        self.assertEqual(self.store.active_bindings(), [])
+        self.assertEqual(self.store.workbook_path.read_bytes(), workbook)
+        events = self.store.events()
+        self.assertTrue(any(e["kind"] == "keys_bound" for e in events))
+        reset_event = next(e for e in events if e["kind"] == "initial_binding_reset")
+        self.assertEqual(reset_event["previous_account_id"], "account-test")
+        self.assertEqual(reset_event["previous_bindings"], [{"name": "甲", "tracking_id": "id-甲"}])
+        self.store.bind_keys([{"name": "甲", "tracking_id": "correct-key"}], "correct-account")
+        self.assertEqual(self.store.load().account_id, "correct-account")
+
+    def test_reset_interruption_retains_old_authoritative_account(self):
+        self.people(("甲", 80))
+        self.bind("甲")
+        raw = json.loads(self.store.config_path.read_text(encoding="utf-8"))
+        raw["account_id"] = "account-test"
+        self.store.config_path.write_text(json.dumps(raw), encoding="utf-8")
+        with patch.object(self.store, "_event", side_effect=RuntimeError("simulated interruption")):
+            with self.assertRaises(RuntimeError):
+                self.store.reset_initial_binding()
+        restored = DataStore(self.folder)
+        self.assertEqual(restored.load().account_id, "account-test")
+        self.assertEqual(restored.active_tracking_ids(), {"id-甲"})
+        self.assertFalse(any(e["kind"] == "initial_binding_reset" for e in restored.events()))
+        self.assertEqual(restored.reset_initial_binding().account_id, "")
+
+    def test_any_snapshot_even_zero_cost_prevents_account_reset(self):
+        self.people(("甲", 80))
+        self.bind("甲")
+        self.snapshot({"甲": 0})
+        self.assertFalse(self.store.can_correct_setup())
+        with self.assertRaises(GuardError):
+            self.store.reset_initial_binding()
+        self.assertEqual(self.store.load().account_id, "account-test")
+        with self.assertRaises(AccountMismatch):
+            self.store.bind_keys([{"name": "甲", "tracking_id": "foreign-key"}], "foreign-account")
+
+    def test_action_without_any_snapshot_prevents_account_reset(self):
+        self.people(("甲", 0))
+        self.bind("甲")
+        for state in ("pending", "unknown_result", "cancelled", "absent_verified"):
+            with self.subTest(state=state):
+                self.store.record_action("甲", "id-甲", state, "fixture")
+                self.assertFalse(self.store.can_correct_setup())
+                with self.assertRaises(GuardError):
+                    self.store.reset_initial_binding()
+
+    def test_changed_start_creates_separate_period_without_carrying_costs(self):
+        self.people(("甲", 80))
+        self.bind("甲")
+        self.snapshot({"甲": 90})
+        old_config = self.store.load()
+        old_files = {p.name: p.read_bytes() for p in self.folder.iterdir() if p.is_file()}
+        earlier = (datetime.now(TZ).date() - timedelta(days=1)).isoformat()
+        successor = self.store.update_start_date(earlier, self.folder / "ledgers" / "earlier")
+        new_config = successor.load()
+        self.assertNotEqual(new_config.period_id, old_config.period_id)
+        self.assertEqual(new_config.start_date, earlier)
+        self.assertEqual(new_config.account_id, old_config.account_id)
+        self.assertEqual(successor.read_people(), self.store.read_people())
+        self.assertIsNone(successor.evaluate()[0]["spent"])
+        self.assertFalse(any(e["kind"] == "snapshot" for e in successor.events()))
+        self.assertEqual({p.name: p.read_bytes() for p in self.folder.iterdir() if p.is_file()}, old_files)
+        # Same source identifier in a different range belongs to the new DB;
+        # its lower total cannot overwrite or add to the preserved old period.
+        successor.apply_snapshot({"id-甲": Decimal(20)}, "sample", earlier, self.start)
+        self.assertEqual(successor.evaluate()[0]["spent"], Decimal(20))
+        self.assertEqual(self.store.evaluate()[0]["spent"], Decimal(90))
+        self.assertEqual(self.store.load(), old_config)
+
+    def test_same_account_successor_keeps_retirement_and_latest_uncertain_action(self):
+        self.people(("甲", 80), ("乙", 0))
+        self.bind("甲", "乙")
+        self.snapshot({"甲": 90, "乙": 0})
+        self.store.record_action("甲", "id-甲", "absent_verified", "fixture retired")
+        self.store.record_action("乙", "id-乙", "requested", "fixture approved")
+        self.store.record_action("乙", "id-乙", "unknown_result", "fixture uncertain")
+        successor = self.store.create_successor(self.folder / "same-account", keep_account=True)
+        self.assertEqual(successor.active_tracking_ids(), {"id-乙"})
+        self.assertEqual(successor.latest_action("id-乙"), "unknown_result")
+        self.assertEqual(successor.latest_action("id-甲"), "absent_verified")
+        actions = [e for e in successor.events() if e["kind"] == "action"]
+        self.assertEqual(len(actions), 2)
+        self.assertTrue(all(e["inherited_from_period"] == self.store.load().period_id for e in actions))
+        self.assertEqual(successor.evaluate()[0]["status"], "retired")
+        self.assertIsNone(successor.evaluate()[0]["spent"])
+        self.assertFalse(successor.can_correct_setup())
+
+    def test_same_account_successor_preserves_operation_id_and_original_evidence(self):
+        self.people(("甲", 0), ("乙", 0))
+        self.bind("甲", "乙")
+        evidence = self.store.action_evidence("甲", "id-甲")
+        self.store.record_action("甲", "id-甲", "requested", "已发许可", operation_id="original-operation", evidence=evidence)
+        self.store.record_action("甲", "id-甲", "unknown_result", "待核验", operation_id="original-operation")
+        successor = self.store.create_successor(self.folder / "operation-successor", keep_account=True)
+        record = successor.latest_action_record("id-甲")
+        self.assertEqual(record["operation_id"], "original-operation")
+        self.assertEqual(record["evidence"], evidence)
+        self.assertNotEqual(record["evidence"]["period_id"], successor.load().period_id)
+        self.assertEqual(successor.unresolved_actions(), [record])
+        with self.assertRaises(GuardError):
+            successor.record_action("乙", "id-乙", "requested", "不能跨目标复用", operation_id="original-operation")
+        successor.record_action("甲", "id-甲", "present_verified", "仍存在", operation_id="original-operation")
+        self.assertEqual(successor.unresolved_actions(), [successor.latest_action_record("id-甲")])
+
+    def test_other_account_successor_starts_unbound_and_preserves_original(self):
+        self.people(("甲", 80))
+        self.bind("甲")
+        self.snapshot({"甲": 90})
+        self.store.record_action("甲", "id-甲", "unknown_result", "fixture uncertain")
+        successor = self.store.create_successor(self.folder / "other-account", keep_account=False)
+        self.assertEqual(successor.load().account_id, "")
+        self.assertEqual(successor.active_bindings(), [])
+        self.assertIsNone(successor.latest_action("id-甲"))
+        self.assertIsNone(successor.evaluate()[0]["spent"])
+        successor.bind_keys([{"name": "甲", "tracking_id": "foreign-key"}], "foreign-account")
+        self.assertEqual(successor.load().account_id, "foreign-account")
+        self.assertEqual(self.store.load().account_id, "account-test")
+        self.assertEqual(self.store.evaluate()[0]["spent"], Decimal(90))
+        self.assertEqual(self.store.latest_action("id-甲"), "unknown_result")
+
+    def test_failed_successor_is_not_published_and_old_ledger_is_unchanged(self):
+        self.people(("甲", 80))
+        self.bind("甲")
+        self.snapshot({"甲": 60})
+        old_files = {p.name: p.read_bytes() for p in self.folder.iterdir() if p.is_file()}
+        destination = self.folder / "new-ledger"
+        with patch.object(DataStore, "save_people", side_effect=GuardError("fixture write failure")):
+            with self.assertRaises(GuardError):
+                self.store.create_successor(destination, keep_account=True)
+        self.assertFalse(destination.exists())
+        self.assertEqual({p.name: p.read_bytes() for p in self.folder.iterdir() if p.is_file()}, old_files)
+        staging = list(self.folder.glob(".new-ledger-*"))
+        self.assertEqual(len(staging), 1)
+        with self.assertRaises(GuardError):
+            DataStore(staging[0]).load()
+
+    def test_date_tampering_and_existing_destination_remain_rejected(self):
+        destination = self.folder / "existing"
+        destination.mkdir()
+        sentinel = destination / "preserve.txt"
+        sentinel.write_text("keep", encoding="utf-8")
+        with self.assertRaises(GuardError):
+            self.store.create_successor(destination)
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+        unused = self.folder / "unchanged"
+        self.assertIs(self.store.update_start_date(self.start, unused), self.store)
+        self.assertFalse(unused.exists())
+        future = (datetime.now(TZ).date() + timedelta(days=1)).isoformat()
+        with self.assertRaises(GuardError):
+            self.store.update_start_date(future, unused)
+        raw = json.loads(self.store.config_path.read_text(encoding="utf-8"))
+        raw["start_date"] = "2000-01-01"
+        self.store.config_path.write_text(json.dumps(raw), encoding="utf-8")
+        with self.assertRaises(GuardError):
+            self.store.load()
 
 
 if __name__ == "__main__":
