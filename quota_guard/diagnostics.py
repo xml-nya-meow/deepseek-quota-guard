@@ -4,15 +4,190 @@ No browser headers, cookies, response bodies or credentials are serialized.
 Unknown complex inputs are described by structure. This log is disposable;
 ledger events are not, and must never depend on this writer succeeding.
 """
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import re
 import threading
 import time
 import uuid
+
+
+DEFAULT_MAX_BYTES = 2_000_000
+DEFAULT_KEEP_FILES = 12
+DEFAULT_RETENTION_DAYS = 14
+CLEANUP_INTERVAL_SECONDS = 60
+PREVIEW_MAX_RECORDS = 300
+PREVIEW_MAX_BYTES = 256 * 1024
+_LOG_NAME = re.compile(
+    r'diagnostic-\d{8}T\d{12}Z-(?P<session>[0-9a-f]{12})(?:-p(?P<pid>[1-9]\d{0,9}))?\.jsonl'
+)
+
+
+def _candidates(folder, *, raise_errors=False):
+    """Only direct, regular files with an exact application-owned name."""
+    result = []
+    try:
+        if Path(folder).is_symlink():
+            return []
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                match = _LOG_NAME.fullmatch(entry.name)
+                if not match or not entry.is_file(follow_symlinks=False):
+                    continue
+                try:
+                    stat = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                result.append((Path(entry.path), stat.st_mtime, stat.st_size, match))
+    except OSError:
+        if raise_errors:
+            raise
+        return []
+    return sorted(result, key=lambda item: (item[1], item[0].name))
+
+
+def _process_is_alive(pid):
+    """Read-only liveness; uncertainty preserves the file rather than deleting it."""
+    if not 1 <= pid <= 0xffffffff:
+        return True
+    if pid == os.getpid():
+        return True
+    if os.name == 'nt':
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        kernel.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel.CloseHandle.restype = wintypes.BOOL
+        handle = kernel.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return ctypes.get_last_error() != 87  # ERROR_INVALID_PARAMETER: no such PID
+        try:
+            code = wintypes.DWORD()
+            return not kernel.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value == 259
+        finally:
+            kernel.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+
+
+@dataclass(frozen=True)
+class DiagnosticPreview:
+    text: str
+    record_count: int = 0
+    skipped_lines: int = 0
+    truncated: bool = False
+    unavailable: bool = False
+
+
+def read_recent_diagnostics(folder, *, max_records=PREVIEW_MAX_RECORDS,
+                            max_bytes=PREVIEW_MAX_BYTES):
+    """Read a bounded tail snapshot; never return raw or malformed log content.
+
+    Both bytes read from disk and UTF-8 bytes returned are capped. A refresh
+    creates no long-lived cache or background thread. Older format names remain
+    readable, and every displayed field is sanitized again on read.
+    """
+    max_records = max(1, min(int(max_records), PREVIEW_MAX_RECORDS))
+    max_bytes = max(1, min(int(max_bytes), PREVIEW_MAX_BYTES))
+    folder = Path(folder)
+    try:
+        candidates = _candidates(folder, raise_errors=True)
+    except FileNotFoundError:
+        return DiagnosticPreview('')
+    except OSError:
+        return DiagnosticPreview('', unavailable=True)
+    if not candidates:
+        return DiagnosticPreview('', unavailable=folder.exists() and not folder.is_dir())
+    remaining = max_bytes
+    rows = []
+    skipped = 0
+    truncated = False
+    unavailable = False
+    for path, _, _, _ in reversed(candidates):
+        if remaining <= 0:
+            truncated = True
+            break
+        try:
+            # A candidate can disappear during rotation; no write or retry loop.
+            if path.is_symlink():
+                continue
+            with path.open('rb') as stream:
+                size = stream.seek(0, 2)
+                start = max(0, size - remaining)
+                stream.seek(start)
+                raw = stream.read(remaining)
+            remaining -= len(raw)
+            if start:
+                truncated = True
+                # The first fragment may be only the tail of a JSON record.
+                raw = raw.partition(b'\n')[2]
+            lines = raw.splitlines()
+            for line in lines:
+                if not line.strip():
+                    continue
+                try:
+                    value = json.loads(line)
+                    if not isinstance(value, dict) or not isinstance(value.get('data'), dict):
+                        raise ValueError('invalid record')
+                    stamp = value.get('time', '')
+                    if not isinstance(stamp, str) or len(stamp) > 40:
+                        raise ValueError('invalid time')
+                    parsed = datetime.fromisoformat(stamp)
+                    if parsed.tzinfo is None:
+                        raise ValueError('missing timezone')
+                    event = value.get('event')
+                    if not isinstance(event, str):
+                        raise ValueError('invalid event')
+                    data = safe_fields(value['data'])
+                    elapsed = value.get('elapsed_ms')
+                    if type(elapsed) is int and elapsed >= 0:
+                        data.setdefault('elapsed_ms', elapsed)
+                    # Keep a writer's pre-hashed identity recognizable without
+                    # trusting arbitrary nested objects from an edited log.
+                    for key, field in value['data'].items():
+                        if (_IDENTITY.fullmatch(key) and isinstance(field, dict)
+                                and set(field) == {'fingerprint'}
+                                and isinstance(field['fingerprint'], str)
+                                and re.fullmatch('[0-9a-f]{12}', field['fingerprint'])):
+                            data[key] = field
+                    session = value.get('session', '')
+                    session = session if isinstance(session, str) and re.fullmatch('[0-9a-f]{12}', session) else ''
+                    display = (f"{parsed.astimezone().isoformat(timespec='seconds')}  "
+                               f"{safe_text(event)}  [{session}]\n"
+                               f"{json.dumps(data, ensure_ascii=False, allow_nan=False)}\n")
+                    rows.append((parsed.timestamp(), display))
+                except (ValueError, TypeError, OverflowError, RecursionError):
+                    skipped += 1
+        except OSError:
+            unavailable = True
+    rows.sort(key=lambda item: item[0], reverse=True)
+    if len(rows) > max_records:
+        truncated = True
+    chosen = []
+    output_size = 0
+    for _, display in rows[:max_records]:
+        size = len(display.encode('utf-8'))
+        if output_size + size > max_bytes:
+            truncated = True
+            break
+        chosen.append(display)
+        output_size += size
+    return DiagnosticPreview(''.join(reversed(chosen)),
+                             len(chosen), skipped, truncated, unavailable)
 
 
 _SECRET = re.compile(r'password|passwd|secret|token|cookie|authorization|otp|verification|验证码|密码', re.I)
@@ -106,38 +281,111 @@ def safe_fields(fields):
 
 class DiagnosticLog:
     """One file per writer; bounded rotation prevents unlimited disk growth."""
-    def __init__(self, folder, *, max_bytes=2_000_000, keep_files=12):
+    def __init__(self, folder, *, max_bytes=DEFAULT_MAX_BYTES,
+                 keep_files=DEFAULT_KEEP_FILES, retention_days=DEFAULT_RETENTION_DAYS):
         self.folder = Path(folder)
         self.max_bytes = max(1024, max_bytes)
         self.keep_files = max(2, keep_files)
+        self.retention_days = max(1, retention_days)
         self.lock = threading.Lock()
         self.session = uuid.uuid4().hex[:12]
         self.started = time.monotonic()
+        self.last_cleanup = None
+        self._file_time = None
         self.path = None
         self.disabled = False
 
     def _new_file(self):
         self.folder.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
-        self.path = self.folder / f'diagnostic-{stamp}-{self.session}.jsonl'
-        candidates = sorted(self.folder.glob('diagnostic-*.jsonl'), key=lambda p: p.name)
-        # Only our specific disposable files; never recurse into ledger data.
-        for old in candidates[:max(0, len(candidates) - self.keep_files + 1)]:
+        current = datetime.now(timezone.utc)
+        if self._file_time is not None and current <= self._file_time:
+            current = self._file_time + timedelta(microseconds=1)
+        # Windows wall-clock resolution can repeat during fast rotation, and
+        # the wall clock can move backwards. Keep names strictly increasing
+        # within this writer and reserve them exclusively; never append to a
+        # supposedly new file that already exists.
+        for _ in range(1000):
+            stamp = current.strftime('%Y%m%dT%H%M%S%fZ')
+            candidate = self.folder / f'diagnostic-{stamp}-{self.session}-p{os.getpid()}.jsonl'
             try:
+                with candidate.open('x', encoding='utf-8', newline='\n'):
+                    pass
+            except FileExistsError:
+                current += timedelta(microseconds=1)
+                continue
+            self._file_time = current
+            self.path = candidate
+            return
+        raise OSError('Unable to reserve a fresh diagnostic file')
+
+    def _cleanup(self):
+        """Best-effort retention with active-writer protection, never recursive.
+
+        The count cap is a steady-state bound: if more than keep_files writers
+        are alive, their current files survive until a later cleanup. A reused
+        PID can conservatively preserve an extra file. Legacy names lack PID;
+        their most recently written session file gets a one-minute grace period.
+        """
+        now = time.time()
+        candidates = _candidates(self.folder)
+        latest = {}
+        for item in candidates:
+            latest[item[3]['session']] = item[0]
+        live = {}
+        protected = {self.path}
+        for path, modified, _, match in candidates:
+            if latest[match['session']] != path or match['session'] == self.session:
+                continue
+            pid = match['pid']
+            if pid is None:
+                if now - modified < CLEANUP_INTERVAL_SECONDS:
+                    protected.add(path)
+            else:
+                pid = int(pid)
+                if pid not in live:
+                    live[pid] = _process_is_alive(pid)
+                if live[pid]:
+                    protected.add(path)
+        remaining = len(candidates)
+        cutoff = now - self.retention_days * 86400
+        for old, modified, _, _ in candidates:
+            if old in protected:
+                continue
+            if modified >= cutoff and remaining <= self.keep_files:
+                continue
+            try:
+                # Recheck links immediately before deleting only this file.
+                if old.is_symlink() or not old.is_file():
+                    continue
                 old.unlink()
+                remaining -= 1
             except OSError:
                 pass
+        self.last_cleanup = time.monotonic()
 
     def emit(self, event, **fields):
         record = {'time': datetime.now(timezone.utc).isoformat(), 'session': self.session,
                   'elapsed_ms': round((time.monotonic() - self.started) * 1000),
                   'event': safe_text(event), 'data': safe_fields(fields)}
         try:
+            serialized = json.dumps(record, ensure_ascii=False, allow_nan=False) + '\n'
+            if len(serialized.encode('utf-8')) > self.max_bytes:
+                # No single event can defeat rotation by carrying a large set
+                # of fields. Keep its time/event and a fixed omission reason.
+                record['data'] = {'reason_code': 'DIAGNOSTIC_RECORD_TOO_LARGE', 'count': len(fields)}
+                record['event'] = record['event'][:128]
+                serialized = json.dumps(record, ensure_ascii=False, allow_nan=False) + '\n'
+            size = len(serialized.encode('utf-8'))
             with self.lock:
-                if self.path is None or not self.path.exists() or self.path.stat().st_size >= self.max_bytes:
+                rotated = (self.path is None or not self.path.exists()
+                           or self.path.stat().st_size + size > self.max_bytes)
+                if rotated:
                     self._new_file()
-                with self.path.open('a', encoding='utf-8') as stream:
-                    stream.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + '\n')
+                with self.path.open('a', encoding='utf-8', newline='\n') as stream:
+                    stream.write(serialized)
+                if (rotated or self.last_cleanup is None
+                        or time.monotonic() - self.last_cleanup >= CLEANUP_INTERVAL_SECONDS):
+                    self._cleanup()
                 self.disabled = False
             return True
         except (OSError, TypeError, ValueError):

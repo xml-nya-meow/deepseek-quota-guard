@@ -12,21 +12,26 @@ from pathlib import Path
 import json
 import os
 import re
-import shutil
 import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, simpledialog
+from tkinter import ttk, filedialog, messagebox
 from typing import Any, Callable
 from uuid import uuid4
 
 from . import __version__
-from .core import AccountMismatch, DataStore, GuardError, Person
+from .core import AccountMismatch, DataStore, GuardError, Person, clean_name, money
 from .revocation_permit import RevocationNotSubmitted
 from .workspace import new_ledger_path, save_current_ledger
 from .preferences import (DEFAULT_POLL_INTERVAL_SECONDS, load_poll_interval,
-                          save_poll_interval, validate_poll_interval)
+                          save_poll_interval, validate_poll_interval, TableDefaults,
+                          load_table_defaults, save_table_defaults)
+from .workbook_template import write_personnel_template
+from .text_prompt import ask_text
+from .appearance import (THEME_MODES, load_theme_mode, save_theme_mode,
+                         resolve_theme, apply_theme)
+from .window_layout import ScrollableContent, fit_window
 
 TZ = timezone(timedelta(hours=8))
 POLL_MS = DEFAULT_POLL_INTERVAL_SECONDS * 1000
@@ -39,6 +44,7 @@ FEE_STATE_LABELS = {
     "CHARGE_TYPE_UNSUPPORTED": "费用类别待适配",
 }
 STATUS_LABELS = {
+    "unassigned": "待填写姓名 · 不参与管理",
     "skipped": "跳过管理", "unknown": "等待有效费用", "ok": "尚未达到额度",
     "triggered": "达到额度 · 待处理", "prepared": "待你在平台确认",
     "pending": "待处理", "absent_verified": "平台列表已不存在 · 原因需核实",
@@ -118,6 +124,19 @@ def parse_editor_person(name: str, amount: str) -> Person:
     return Person(name, number)
 
 
+def prepare_initial_draft(rows) -> tuple[list[Person], int]:
+    """Only a new-table draft may leave unnamed rows unassigned at save time."""
+    people, unassigned = [], 0
+    for name, amount in rows:
+        name = clean_name(name)
+        number = money(amount, allow_skip=True)
+        if not name and number != -1:
+            number = Decimal(-1)
+            unassigned += 1
+        people.append(Person(name, number))
+    return people, unassigned
+
+
 class App:
     def __init__(self, root: tk.Tk, folder: Path, home_folder: Path | None = None):
         self.root = root
@@ -148,6 +167,8 @@ class App:
         self.action_states = {}
         self.button_labels = {}
         self.pending_login = False
+        self.pending_start = None
+        self.start_refresh_required = False
         self.reset_on_login = False
         self.pending_change = None
         self.observing = False
@@ -159,6 +180,10 @@ class App:
         self.closing = False
         self.timer = None
         self.poll_interval_seconds, self.poll_preference_notice = load_poll_interval(self.home_folder)
+        self.table_defaults, self.table_defaults_notice = load_table_defaults(self.home_folder)
+        self.theme_mode, self.theme_notice = load_theme_mode(self.home_folder)
+        self.current_theme = None
+        self.theme_timer = None
         self.poll_timer_generation = 0
         self.poll_wait_started = None
         self.rows: list[dict] = []
@@ -170,10 +195,11 @@ class App:
         self.diagnostics = DiagnosticLog(self.diagnostics_dir)
         self._diagnostic("ui_opened")
         self.root.title(f"DeepSeek 额度管理 {__version__} · 候选预发布")
-        self.root.geometry("1120x740")
-        self.root.minsize(930, 650)
+        fit_window(self.root)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self._build()
+        self._refresh_theme()
+        self.theme_timer = self.root.after(5000, self._watch_theme)
         self.root.after(60, self.load_folder)
         self.root.after(1000, self._watch_workbook)
 
@@ -187,20 +213,21 @@ class App:
         style.configure("Muted.TLabel", foreground="#526174")
         style.configure("Warn.TLabel", foreground="#915212")
         self.root.option_add("*Font", ("Microsoft YaHei UI", 10))
-        outer = ttk.Frame(self.root, padding=18)
-        outer.pack(fill="both", expand=True)
+        self.main_content = ScrollableContent(self.root, padding=18)
+        self.main_content.pack(fill="both", expand=True)
+        outer = self.main_content.content
         ttk.Label(outer, text="DeepSeek 额度管理", style="Title.TLabel").pack(anchor="w")
         ttk.Label(outer, text="核对平台费用 · 按人员核算 · 保留处理记录", style="Muted.TLabel").pack(anchor="w", pady=(3, 12))
         self.path_var = tk.StringVar(value=f"数据文件夹：{self.folder}")
-        ttk.Label(outer, textvariable=self.path_var, wraplength=1040).pack(anchor="w")
+        self.main_content.wrap(ttk.Label(outer, textvariable=self.path_var, wraplength=1040)).pack(anchor="w")
         self.summary_var = tk.StringVar(value="正在检查已有数据……")
-        ttk.Label(outer, textvariable=self.summary_var, wraplength=1040).pack(anchor="w", pady=(8, 8))
+        self.main_content.wrap(ttk.Label(outer, textvariable=self.summary_var, wraplength=1040)).pack(anchor="w", pady=(8, 8))
         bar = ttk.Frame(outer)
         bar.pack(fill="x", pady=(0, 7))
         self.buttons = {}
         specs = [
             ("folder", "数据文件夹", self.choose_folder),
-            ("setup", "首次设置", self.setup),
+            ("setup", "新建列表", self.setup),
             ("date", "修改统计起点", self.change_start_date),
             ("template", "保存 Excel 模板", self.save_template),
             ("import_people", "导入人员 Excel", self.import_people),
@@ -226,7 +253,7 @@ class App:
             ("collect", "立即读取费用", self.collect),
             ("start", "启动全自动管理", self.start),
             ("stop", "停止管理", self.stop),
-            ("revoke", "自动删除选中 Key（仅本次）", self.revoke_selected_once),
+            ("revoke", "强制删除选中 Key", self.revoke_selected_once),
             ("verify", "核实平台状态", self.verify_revoke),
         ]:
             b = ttk.Button(bar2, text=text, command=self._button_command(key, command))
@@ -258,7 +285,22 @@ class App:
         self.buttons['poll_interval'].pack(side="left", padx=(0, 10))
         self.poll_feedback_var = tk.StringVar(value=self.poll_preference_notice or '每轮处理完成后等待；可设置 1～3600 秒。')
         ttk.Label(poll_bar, textvariable=self.poll_feedback_var, style='Muted.TLabel').pack(side="left")
-        ttk.Label(outer, text="单次自动删除仅处理选中的已达额 Key；全自动管理会周期读取并自动永久撤销达额 Key，无需逐枚人工审批。“立即读取”只核对数据。账单延迟与在途请求仍可能超支；真实自动撤销尚待验证。", style="Warn.TLabel", wraplength=1040).pack(anchor="w", pady=(0, 10))
+        defaults_bar = ttk.Frame(outer)
+        defaults_bar.pack(fill="x", pady=(0, 5))
+        ttk.Label(defaults_bar, text="斩杀线").pack(side="left")
+        self.kill_line_var = tk.StringVar(value=amount_text(self.table_defaults.kill_line))
+        ttk.Entry(defaults_bar, textvariable=self.kill_line_var, width=22).pack(side="left", padx=(7, 4))
+        ttk.Label(defaults_bar, text="元　新表默认填").pack(side="left")
+        self.table_fill_var = tk.StringVar(value='-1（跳过管理）' if self.table_defaults.fill_mode == 'skip' else '斩杀线')
+        ttk.Combobox(defaults_bar, textvariable=self.table_fill_var, state='readonly', width=17,
+                     values=('-1（跳过管理）', '斩杀线')).pack(side="left", padx=7)
+        self.buttons['table_defaults'] = ttk.Button(defaults_bar, text="保存新表默认", command=self.apply_table_defaults)
+        self.buttons['table_defaults'].pack(side="left")
+        self.theme_button = ttk.Button(defaults_bar, command=self.cycle_theme)
+        self.theme_button.pack(side="right")
+        self.defaults_feedback_var = tk.StringVar(value=self.table_defaults_notice or '斩杀线最小为 0，仅预填新表个人额度；已有人员额度不变。')
+        self.main_content.wrap(ttk.Label(outer, textvariable=self.defaults_feedback_var, style='Muted.TLabel', wraplength=1100)).pack(anchor='w', pady=(0, 8))
+        self.main_content.wrap(ttk.Label(outer, text="强制删除只处理选中的 Key，不要求达到额度；全自动管理会周期读取并自动永久撤销达额 Key，无需逐枚人工审批。未填写姓名的行不参与管理。“立即读取”只核对数据。账单延迟与在途请求仍可能超支；真实自动撤销尚待验证。", style="Warn.TLabel", wraplength=1040)).pack(anchor="w", pady=(0, 10))
         tabs = ttk.Notebook(outer)
         tabs.pack(fill="both", expand=True)
         overview = ttk.Frame(tabs, padding=8)
@@ -266,7 +308,7 @@ class App:
         tabs.add(overview, text="人员与额度")
         tabs.add(reports, text="处理汇报")
         columns = ("name", "amount", "share", "spent", "status")
-        self.tree = ttk.Treeview(overview, columns=columns, show="headings", selectmode="browse")
+        self.tree = ttk.Treeview(overview, columns=columns, show="headings", selectmode="browse", height=7)
         for col, title, width in zip(columns, ["API名 / 人员名", "个人额度（元）", "公共额度（元）", "累计费用（元）", "当前状态"], [190, 150, 150, 150, 270]):
             self.tree.heading(col, text=title)
             self.tree.column(col, width=width, minwidth=90, anchor="w")
@@ -286,39 +328,40 @@ class App:
         self.buttons["reports"].pack(side="left")
         self.buttons["logs"] = ttk.Button(report_bar, text="打开日志文件夹", command=self._button_command("logs", self.open_folder))
         self.buttons["logs"].pack(side="left", padx=8)
-        self.report_text = tk.Text(reports, wrap="word", state="disabled", relief="flat", bg="#f6f8fa", padx=12, pady=10)
+        self.report_text = tk.Text(reports, wrap="word", state="disabled", relief="flat", bg="#f6f8fa", padx=12, pady=10, height=8)
         report_scroll = ttk.Scrollbar(reports, command=self.report_text.yview)
         self.report_text.configure(yscrollcommand=report_scroll.set)
         report_scroll.pack(side="right", fill="y")
         self.report_text.pack(fill="both", expand=True)
         self.status_var = tk.StringVar(value="尚未启动观察")
-        ttk.Label(outer, textvariable=self.status_var, wraplength=1040).pack(anchor="w", pady=(10, 0))
+        self.main_content.wrap(ttk.Label(outer, textvariable=self.status_var, wraplength=1040)).pack(anchor="w", pady=(10, 0))
         self.progress_var = tk.StringVar(value="当前操作：空闲")
-        ttk.Label(outer, textvariable=self.progress_var, style="Muted.TLabel", wraplength=1040).pack(anchor="w", pady=(4, 0))
+        self.main_content.wrap(ttk.Label(outer, textvariable=self.progress_var, style="Muted.TLabel", wraplength=1040)).pack(anchor="w", pady=(4, 0))
         self.audit_var = tk.StringVar(value="")
-        ttk.Label(outer, textvariable=self.audit_var, style="Warn.TLabel", wraplength=1040).pack(anchor="w")
+        self.main_content.wrap(ttk.Label(outer, textvariable=self.audit_var, style="Warn.TLabel", wraplength=1040)).pack(anchor="w")
         self._update_buttons()
 
     def _update_buttons(self):
         if self.browser is not None and getattr(self.browser, 'cleanup_failed', False):
             self.cleanup_failed = True
-        changing = self.pending_login or self.pending_change is not None or self.interrupting or self.cleanup_failed or self.audit_failed
+        changing = self.pending_login or self.pending_change is not None or self.pending_start is not None or self.interrupting or self.cleanup_failed or self.audit_failed
         ready = self.config is not None and not self.busy and not self.closing and not changing
         for key, button in self.buttons.items():
             self.button_labels.setdefault(key, str(button.cget("text")))
             label = self.button_labels[key]
             state = self.action_states.get(key)
             if key == "start":
-                label = "全自动管理：已开启" if self.observing else ("全自动管理：已停止" if state == "已停止" else "启动全自动管理")
+                label = ("启动前：正在重新读取" if self.pending_start is not None else
+                         "全自动管理：已开启" if self.observing else ("全自动管理：已停止" if state == "已停止" else "启动全自动管理"))
             elif state:
                 label = {"login": "登录", "collect": "读取费用"}.get(key, label) + "：" + state
             enabled = ready
             if key in {"folder", "setup"}:
                 enabled = not self.busy and not self.closing and not changing
             if key == "setup":
-                enabled = enabled and self.config is None
+                enabled = enabled and not self.recovery_mode and self.single_revoke_id is None
             if key == "stop":
-                enabled = (self.observing or self.single_revoke_id is not None) and not self.closing
+                enabled = (self.observing or self.single_revoke_id is not None or self.pending_start is not None) and not self.closing
             if key == "start":
                 enabled = ready and not self.observing
             if key in {"edit", "excel", "check", "import_people"}:
@@ -331,7 +374,7 @@ class App:
                 enabled = not self.closing
             if key == "diagnostics":
                 enabled = not self.closing
-            if key == 'poll_interval':
+            if key in {'poll_interval', 'table_defaults'}:
                 enabled = not self.closing
             if key in {"revoke", "verify", "inspect"}:
                 enabled = ready and not self.observing
@@ -346,6 +389,54 @@ class App:
             if self.recovery_mode and key == "import_people":
                 label = "恢复人员 Excel"
             button.configure(text=label, state="normal" if enabled else "disabled")
+
+    def _refresh_theme(self):
+        theme = resolve_theme(self.theme_mode)
+        if theme != self.current_theme:
+            apply_theme(self.root, theme)
+            self.current_theme = theme
+        label = {'system': '跟随系统', 'light': '浅色', 'dark': '深色'}[self.theme_mode]
+        if self.theme_mode == 'system':
+            label += '（深色）' if theme == 'dark' else '（浅色）'
+        self.theme_button.configure(text='外观：' + label)
+
+    def _watch_theme(self):
+        self.theme_timer = None
+        if self.closing:
+            return
+        if self.theme_mode == 'system':
+            self._refresh_theme()
+        self.theme_timer = self.root.after(5000, self._watch_theme)
+
+    def cycle_theme(self):
+        if self.closing:
+            return
+        mode = THEME_MODES[(THEME_MODES.index(self.theme_mode) + 1) % len(THEME_MODES)]
+        try:
+            save_theme_mode(self.home_folder, mode)
+        except (ValueError, OSError) as exc:
+            self.status_var.set('外观未保存，继续使用原模式：' + safe_error(exc))
+            return
+        self.theme_mode = mode
+        self._refresh_theme()
+        self.status_var.set('外观已保存。点击外观按钮可在跟随系统、浅色、深色之间切换。')
+
+    def _set_table_defaults(self, line, mode):
+        defaults = save_table_defaults(self.home_folder, line, mode)
+        self.table_defaults = defaults
+        self.kill_line_var.set(amount_text(defaults.kill_line))
+        self.table_fill_var.set('-1（跳过管理）' if defaults.fill_mode == 'skip' else '斩杀线')
+        self.defaults_feedback_var.set(f'已保存：斩杀线 {amount_text(defaults.kill_line)} 元，新表预填 {amount_text(defaults.amount)}；已有人员额度不变。')
+        return defaults
+
+    def apply_table_defaults(self):
+        if self.closing:
+            return
+        try:
+            mode = {'-1（跳过管理）': 'skip', '斩杀线': 'kill_line'}[self.table_fill_var.get()]
+            self._set_table_defaults(self.kill_line_var.get(), mode)
+        except (ValueError, OSError, KeyError) as exc:
+            self.defaults_feedback_var.set('新表默认未保存：' + safe_error(exc))
 
     def apply_poll_interval(self):
         """Save local timing preferences without changing any ledger evidence."""
@@ -511,6 +602,8 @@ class App:
         self.collection_has_fees = False
         self.action_states["collect"] = "待重新读取"
         if session:
+            self.pending_start = None
+            self.start_refresh_required = False
             self.session_ready = False
             self.action_states["login"] = "待核验"
         self._update_buttons()
@@ -522,6 +615,7 @@ class App:
 
     def _remember_collection(self, result):
         self.collection_context = self._collection_context()
+        self.start_refresh_required = False
         self.collection_end_date = result['end_date']
         # The worker's timestamps prevent a queued result becoming "fresh"
         # merely because the UI resumed after sleep or a blocked event loop.
@@ -591,7 +685,7 @@ class App:
             self.store = DataStore(self.folder)
             if not existing:
                 self.summary_var.set("首次运行：先填写人数和总预算，然后生成两列表格。")
-                self.status_var.set("没有既有记录。请选择“首次设置”，或打开已有数据文件夹。")
+                self.status_var.set("没有既有记录。请选择“新建列表”，或打开已有数据文件夹。")
                 self._update_buttons()
                 return
             self.config = self.store.load(require_workbook=False)
@@ -696,7 +790,7 @@ class App:
         if self.recovery_mode or not self.config or self.closing or self.audit_failed:
             return
         self.stop(quiet=True)
-        start = simpledialog.askstring("修改统计起点", "新的统计起点（YYYY-MM-DD）：\n将保留原账本，并从完整新周期重新读取费用。",
+        start = ask_text("修改统计起点", "新的统计起点（YYYY-MM-DD）：\n将保留原账本，并从完整新周期重新读取费用。",
                                        initialvalue=self.config.start_date, parent=self.root)
         if not start or start.strip() == self.config.start_date:
             return
@@ -725,24 +819,63 @@ class App:
             self.status_var.set("原账本已保留。请点击“登录 / 重新登录”登录原账户。")
 
     def setup(self):
-        if has_saved_data(self.folder):
-            self.error("不能重新初始化", "此文件夹已有设置、统计或日志。请恢复原记录，或选择新的空数据文件夹。")
+        if (self.busy or self.closing or self.recovery_mode or self.pending_login
+                or self.pending_change is not None or self.interrupting or self.cleanup_failed
+                or self.audit_failed or self.single_revoke_id is not None):
             return
+        if self.config is None and has_saved_data(self.folder):
+            self.error("请先恢复原列表", "当前文件夹已有记录但未正常加载。请先恢复记录，不能覆盖初始化。")
+            return
+        self.stop(quiet=True)
+        original_store, original_config = self.store, self.config
+        original_hash = self.store.workbook_hash() if self.config else None
         dialog = tk.Toplevel(self.root)
-        dialog.title("首次设置")
+        dialog.title("新建列表")
+        fit_window(dialog, preferred=(680, 680), minimum=(440, 360))
         dialog.transient(self.root)
         dialog.grab_set()
-        body = ttk.Frame(dialog, padding=22)
-        body.pack(fill="both", expand=True)
-        ttk.Label(body, text="设置本期预算", style="Title.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 15))
-        values = [tk.StringVar(value="14"), tk.StringVar(value="1500"), tk.StringVar(value=datetime.now(TZ).strftime("%Y-%m-%d"))]
+        footer = ttk.Frame(dialog, padding=(22, 10))
+        footer.pack(side='bottom', fill='x')
+        scroller = ScrollableContent(dialog, padding=22)
+        scroller.pack(fill="both", expand=True)
+        body = scroller.content
+        body.columnconfigure(1, weight=1)
+        ttk.Label(body, text="新建列表并设置预算", style="Title.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 15))
+        values = [tk.StringVar(value=str(self.config.people_count) if self.config else "14"),
+                  tk.StringVar(value=amount_text(self.config.total_budget) if self.config else "1500"),
+                  tk.StringVar(value=self.config.start_date if self.config else datetime.now(TZ).strftime("%Y-%m-%d"))]
         for row, (label, value) in enumerate(zip(["分配人数", "本期总预算（元）", "统计起点（YYYY-MM-DD）"], values), 1):
             ttk.Label(body, text=label).grid(row=row, column=0, sticky="w", pady=7, padx=(0, 18))
-            ttk.Entry(body, textvariable=value, width=24).grid(row=row, column=1)
-        ttk.Label(body, text="公共额度按总预算 ÷ 人数向下取整到元。\n起点应覆盖本期已有消费，不会默认清零。\n新表金额均为 -1，填写并检查后才纳入管理。", wraplength=420).grid(row=4, column=0, columnspan=2, pady=15, sticky="w")
+            ttk.Entry(body, textvariable=value, width=24).grid(row=row, column=1, sticky='ew')
+        line_var = tk.StringVar(value=amount_text(self.table_defaults.kill_line))
+        mode_var = tk.StringVar(value=self.table_defaults.fill_mode)
+        ttk.Label(body, text="斩杀线（元，最小 0）").grid(row=4, column=0, sticky="w", pady=7)
+        ttk.Entry(body, textvariable=line_var, width=24).grid(row=4, column=1, sticky='ew')
+        mode_frame = ttk.Frame(body)
+        mode_frame.grid(row=5, column=0, columnspan=2, sticky='w', pady=7)
+        ttk.Label(mode_frame, text='新表默认填：').pack(side='left')
+        ttk.Radiobutton(mode_frame, text='-1（跳过管理）', variable=mode_var, value='skip').pack(side='left')
+        ttk.Radiobutton(mode_frame, text='斩杀线', variable=mode_var, value='kill_line').pack(side='left', padx=8)
+        inherit_var = tk.BooleanVar(value=self.config is not None)
+        choices = ttk.Frame(body)
+        choices.grid(row=6, column=0, columnspan=2, sticky='w', pady=7)
+        ttk.Radiobutton(choices, text='延续现有人员与个人额度', variable=inherit_var,
+                        value=True, state='normal' if self.config else 'disabled').pack(anchor='w')
+        ttk.Radiobutton(choices, text='建立空白列表（使用上方新表默认值）', variable=inherit_var,
+                        value=False).pack(anchor='w')
+        scroller.wrap(ttk.Label(body, text="点击创建后进入独立新列表，旧列表和记录完整保留；取消则不新建。\n延续只保留人员与个人额度，费用按所选日期重新读取。\n同账户的 Key 绑定和未结清处理记录始终保留。\n公共额度按总预算 ÷ 人数向下取整到元；空白姓名不纳入管理。", wraplength=500), padding=48).grid(row=7, column=0, columnspan=2, pady=15, sticky="w")
+
+        def validate_source():
+            if (self.store is not original_store or self.config != original_config
+                        or (original_config and self.store.workbook_hash() != original_hash)
+                        or self.busy or self.closing or self.interrupting or self.cleanup_failed
+                        or self.audit_failed or self.pending_login or self.pending_change is not None
+                        or self.single_revoke_id is not None or self.observing or self.automatic):
+                raise GuardError('原列表或会话状态已变化，请关闭此窗口后重新新建。')
 
         def create():
             try:
+                validate_source()
                 n = int(values[0].get())
                 budget = Decimal(values[1].get().strip())
                 start = values[2].get().strip()
@@ -752,8 +885,18 @@ class App:
                     raise ValueError("统计起点不能在未来。")
                 if budget == 0 and not messagebox.askyesno("零总预算", "公共额度将为 0。所有纳入管理的人员都会进入停用流程。仍按此预算生成表格？", parent=dialog):
                     return
-                self.config = self.store.initialize(n, budget, start)
-                save_current_ledger(self.home_folder, self.folder)
+                validate_source()
+                defaults = self._set_table_defaults(line_var.get(), mode_var.get())
+                self.stop(quiet=True)
+                self.session_generation += 1
+                self._invalidate_collection(session=True)
+                if original_config:
+                    successor = original_store.create_list(new_ledger_path(self.home_folder), n, budget, start,
+                                                           inherit_people=inherit_var.get(), initial_amount=defaults.amount)
+                    self._switch_folder(successor.folder, reset_session=False)
+                else:
+                    self.config = self.store.initialize(n, budget, start, initial_amount=defaults.amount)
+                    save_current_ledger(self.home_folder, self.folder)
             except Exception as exc:
                 messagebox.showerror("创建失败", safe_error(exc), parent=dialog)
                 return
@@ -762,11 +905,12 @@ class App:
             self.refresh_rows()
             self._action_state("setup", "已完成")
             self._update_buttons()
-            self.status_var.set("首次设置已完成，已生成表格。请填写并保存，再检查数据。")
+            self.status_var.set("新列表已创建，旧列表和记录已保留。请保存人员表并重新读取费用；全自动管理保持停止。")
             self.edit_people()
 
-        ttk.Button(body, text="生成表格", command=self._button_command("setup_save", create)).grid(row=5, column=0, sticky="w")
-        ttk.Button(body, text="取消", command=self._button_command("setup_cancel", dialog.destroy)).grid(row=5, column=1, sticky="e")
+        ttk.Button(footer, text="创建新列表", command=self._button_command("setup_save", create)).pack(side='left')
+        ttk.Button(footer, text="取消", command=self._button_command("setup_cancel", dialog.destroy)).pack(side='right')
+        apply_theme(self.root, self.current_theme)
 
     def open_excel(self):
         try:
@@ -790,9 +934,10 @@ class App:
             if target == self.folder / DataStore.WORKBOOK or (target.name.casefold() == DataStore.WORKBOOK.casefold() and DataStore(target.parent).has_history()):
                 raise ValueError("模板不能覆盖当前使用的人员额度表，请另选文件名。")
             runtime = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1]))
-            shutil.copyfile(runtime / "templates" / "人员额度模板.xlsx", target)
+            write_personnel_template(target, runtime / "templates" / "人员额度模板.xlsx",
+                                     self.table_defaults.amount, self.config.people_count if self.config else 14)
             self._action_state("template", "已完成")
-            self.status_var.set(f"模板已保存：{target}。填写两列后点击“导入人员 Excel”。")
+            self.status_var.set(f"模板已保存：{target}，金额预填 {amount_text(self.table_defaults.amount)}。填写姓名后导入；不用的行填 -1 或删除。")
         except Exception as exc:
             self._action_state("template", "失败")
             self.error("模板未保存", exc)
@@ -863,119 +1008,15 @@ class App:
             self.error("无法打开文件夹", exc)
 
     def open_diagnostics(self):
-        try:
-            self.diagnostics_dir.mkdir(parents=True, exist_ok=True)
-            os.startfile(str(self.diagnostics_dir))
-            self._action_state("diagnostics", "已完成")
-            self.status_var.set(f"已打开临时诊断日志：{self.diagnostics_dir}")
-        except OSError as exc:
-            self._action_state("diagnostics", "失败")
-            self.error("无法打开诊断日志", exc, dialog=False)
+        from .diagnostics_ui import open_diagnostics_viewer
+        open_diagnostics_viewer(self)
 
-    def edit_people(self):
+    def edit_people(self, initial_amount=None):
         if self.recovery_mode:
             self.status_var.set('请先恢复原人员表或导入有效 Excel；不会从空白表覆盖原账本。')
             return
-        try:
-            expected_hash = self.store.workbook_hash()
-            people = self.store.read_people()
-        except Exception as exc:
-            self.error("无法读取表格", exc)
-            return
-        dialog = tk.Toplevel(self.root)
-        dialog.title("填写两列表格")
-        dialog.geometry("720x580")
-        dialog.transient(self.root)
-        dialog.grab_set()
-        self._action_state("edit", "编辑中")
-        self.status_var.set("人员表已打开。修改后请点击“保存表格并检查”完成保存。")
-        body = ttk.Frame(dialog, padding=16)
-        body.pack(fill="both", expand=True)
-        ttk.Label(body, text="-1 跳过　｜　0 零额度，需停用　｜　正数为个人累计额度", wraplength=670).pack(anchor="w", pady=(0, 10))
-        table = ttk.Treeview(body, columns=("name", "amount"), show="headings", selectmode="browse")
-        table.heading("name", text="API名/人员名")
-        table.heading("amount", text="个人金额（元）")
-        table.column("name", width=370)
-        table.column("amount", width=180)
-        sb = ttk.Scrollbar(body, command=table.yview)
-        table.configure(yscrollcommand=sb.set)
-        table.pack(fill="both", expand=True, side="top")
-        for p in people:
-            table.insert("", "end", values=(p.name, amount_text(p.amount)))
-        if not people:
-            table.insert("", "end", values=("", "-1"))
-        form = ttk.Frame(body)
-        form.pack(fill="x", pady=12)
-        name_var, amount_var = tk.StringVar(), tk.StringVar(value="-1")
-        editor_status = tk.StringVar(value="编辑后请保存整张表。")
-        ttk.Label(form, text="名字").grid(row=0, column=0, sticky="w")
-        ttk.Entry(form, textvariable=name_var, width=30).grid(row=1, column=0, padx=(0, 15))
-        ttk.Label(form, text="个人金额（元）").grid(row=0, column=1, sticky="w")
-        ttk.Entry(form, textvariable=amount_var, width=18).grid(row=1, column=1)
-
-        def select(_event=None):
-            chosen = table.selection()
-            if chosen:
-                name, amount = table.item(chosen[0], "values")
-                name_var.set(name)
-                amount_var.set(amount)
-
-        def apply_row(new=False):
-            try:
-                p = parse_editor_person(name_var.get(), amount_var.get())
-            except ValueError as exc:
-                messagebox.showerror("请检查这一行", str(exc), parent=dialog)
-                return
-            chosen = table.selection()
-            if chosen and not new:
-                table.item(chosen[0], values=(p.name, str(p.amount)))
-                editor_status.set("选中行已更新，尚未保存整张表。")
-            else:
-                table.selection_set(table.insert("", "end", values=(p.name, str(p.amount))))
-                editor_status.set("新行已添加，尚未保存整张表。")
-
-        def remove():
-            for item in table.selection():
-                table.delete(item)
-            name_var.set("")
-            amount_var.set("-1")
-            editor_status.set("选中行已移除，尚未保存整张表。")
-
-        def save():
-            try:
-                result = [parse_editor_person(*table.item(item, "values")) for item in table.get_children()]
-                zeros = [p.name for p in result if p.amount == 0]
-                zero_note = f"其中 {len(zeros)} 人为 0 元：后续核对 Key 后会进入停用流程。\n" if zeros else ""
-                if not messagebox.askyesno("保存并检查", zero_note + "保存这份表格？运行中的 Key 不会因为保存表格就被删除。", parent=dialog):
-                    return
-                self.store.save_people(result, expected_hash=expected_hash)
-                self.validated_hash = None
-                self._invalidate_collection()
-            except Exception as exc:
-                messagebox.showerror("未保存", safe_error(exc), parent=dialog)
-                return
-            dialog.destroy()
-            self._action_state("edit", "已完成")
-            self.check_people(show_dialog=False)
-            self.status_var.set("表格保存已完成。请重新读取平台费用，再启动自动管理。")
-
-        def cancel():
-            self._action_state("edit", "已关闭")
-            self.status_var.set("人员表已关闭，本次未保存。")
-            dialog.destroy()
-
-        dialog.protocol("WM_DELETE_WINDOW", cancel)
-
-        table.bind("<<TreeviewSelect>>", select)
-        operations = ttk.Frame(body)
-        operations.pack(fill="x", pady=(0, 10))
-        ttk.Button(operations, text="更新选中行", command=self._button_command("editor_update", apply_row)).pack(side="left")
-        ttk.Button(operations, text="添加新行", command=self._button_command("editor_add", lambda: apply_row(True))).pack(side="left", padx=8)
-        ttk.Button(operations, text="移除选中行", command=self._button_command("editor_remove", remove)).pack(side="left")
-        ttk.Label(body, textvariable=editor_status, wraplength=670).pack(anchor="w", pady=(0, 6))
-        ttk.Label(body, text="修改输入框后先点击“更新选中行”，最后保存整张表。外部 Excel 同时改动时将拒绝覆盖。", wraplength=670, style="Muted.TLabel").pack(anchor="w", pady=(0, 10))
-        ttk.Button(body, text="保存表格并检查", command=self._button_command("editor_save", save)).pack(side="left")
-        ttk.Button(body, text="取消", command=self._button_command("editor_cancel", cancel)).pack(side="right")
+        from .people_editor_ui import open_people_editor
+        open_people_editor(self, initial_amount)
 
     def check_people(self, show_dialog=True) -> bool:
         try:
@@ -990,8 +1031,8 @@ class App:
             self.refresh_rows()
             if self.recovery_mode:
                 raise GuardError('检查期间人员表再次不可用，请恢复完整表格后重新检查。')
-            count = sum(p.amount != -1 for p in people)
-            zeros = sum(p.amount == 0 for p in people)
+            count = sum(bool(p.name) and p.amount != -1 for p in people)
+            zeros = sum(bool(p.name) and p.amount == 0 for p in people)
             checked_hash = self.store.workbook_hash()
             if self.validated_hash != checked_hash:
                 self._invalidate_collection()
@@ -1107,9 +1148,9 @@ class App:
             self._update_buttons()
         if self.busy or self.closing or self.interrupting or self.cleanup_failed or self.audit_failed:
             return
-        button_key = {"prepare_revoke": "revoke", "verify_revoke": "verify", "inspect_revoke": "inspect"}.get(action, action)
+        button_key = {"prepare_revoke": "revoke", "read_keys": "revoke", "verify_revoke": "verify", "inspect_revoke": "inspect"}.get(action, action)
         action_title = {"login": "打开登录浏览器", "collect": "读取平台费用", "prepare_revoke": "定位处理页面",
-                        "inspect_revoke": "只读检查删除准备", "verify_revoke": "核实平台状态", "revoke": "自动撤销"}.get(action, "操作平台")
+                        "read_keys": "核验所选 Key 身份", "inspect_revoke": "只读检查删除准备", "verify_revoke": "核实平台状态", "revoke": "撤销 Key"}.get(action, "操作平台")
 
         def failed(exc):
             self.stop(quiet=True)
@@ -1138,7 +1179,7 @@ class App:
                 self.error("账户与当前账本不一致", exc, dialog=False,
                            next_step="请重新登录原账户。" if self.recovery_mode else "请重新登录原账户，或点击“为当前账户建账本”确认建立独立账本。")
             else:
-                self.error(action_title + "失败", exc, dialog=action not in {"collect", "login"}, next_step=next_step)
+                self.error(action_title + "失败", exc, dialog=action != "collect", next_step=next_step)
 
         try:
             if self.browser is None or getattr(self.browser, 'closed', False):
@@ -1246,7 +1287,7 @@ class App:
         self._update_buttons()
         self.root.after(0, self._drain_pending)
 
-    def collect(self):
+    def collect(self, *, after_read=None):
         if self.recovery_mode or self.busy or not self.config or self.pending_login or self.pending_change is not None or self.closing or self.interrupting or self.cleanup_failed or self.audit_failed:
             return
         self._cancel_collection_poll()
@@ -1285,6 +1326,10 @@ class App:
                     self._invalidate_collection(session=True)
                 if self.observing:
                     self._schedule_processing()
+                if after_read is not None:
+                    # The continuation clears its token before rechecking fresh
+                    # evidence, including a clock/day change after this read.
+                    self.root.after(0, after_read)
                 return
             self.retry_collection = True
             self.store.apply_snapshot(result["totals"], result["source_id"], result["start_date"], result["end_date"])
@@ -1301,17 +1346,22 @@ class App:
                 self.root.bell()
             if self.observing:
                 self._schedule_processing()
+            if after_read is not None:
+                self.root.after(0, after_read)
         self._browser_action("collect", done, start_date=self.config.start_date,
                              account_id=self.store.load().account_id,
                              known_keys=self.store.active_tracking_ids())
 
     def start(self):
-        if self.recovery_mode or self.busy or self.observing or self.pending_login or self.pending_change is not None or self.closing or self.interrupting or self.cleanup_failed or self.audit_failed or not self.check_people(show_dialog=False):
+        if self.recovery_mode or self.busy or self.observing or self.pending_start is not None or self.pending_login or self.pending_change is not None or self.closing or self.interrupting or self.cleanup_failed or self.audit_failed or not self.check_people(show_dialog=False):
             return
         if not self.session_ready:
             self.status_var.set("自动管理未开启。请先点击“登录 / 重新登录”，在浏览器完成登录，再点击“立即读取费用”核验账户与费用。")
             return
         if not self._collection_is_current():
+            if self.start_refresh_required:
+                self._refresh_before_start()
+                return
             self._invalidate_collection()
             self.status_var.set("自动管理未开启。请先点击“立即读取费用”；读取已过期、跨日或配置已变化时需要重新核验。")
             return
@@ -1323,7 +1373,7 @@ class App:
         except GuardError as exc:
             self.error('自动管理未开启', exc, dialog=False)
             return
-        managed = [p.name for p in self.store.read_people() if p.amount >= 0]
+        managed = [p.name for p in self.store.read_people() if p.name and p.amount >= 0]
         fees_note = ("\n当前费用尚未就绪：费用未核验，仅零额度可处理；正额度人员的未知费用不会按零元计算。\n" if not self.collection_has_fees else "")
         confirmation_generation = self.management_generation
         confirmation_store = self.store
@@ -1362,8 +1412,73 @@ class App:
         self._update_buttons()
         self._schedule_processing()
 
+    def _refresh_before_start(self):
+        """An explicit start after force-identity work gets a new read first.
+
+        Do not reuse old fees or re-login. This read never starts management by
+        itself: its continuation must still reach the normal start confirmation.
+        """
+        if self.pending_start is not None:
+            return
+        if self.store.unresolved_actions():
+            self.status_var.set('自动管理未开启。请先核实上次操作的结果，再启动。')
+            self._diagnostic('start_refresh_blocked', reason_code='UNRESOLVED_ACTION')
+            return
+        if self.browser is None or getattr(self.browser, 'closed', False):
+            self.status_var.set('自动管理未开启。浏览器会话已关闭，请先登录并读取费用。')
+            return
+        token = object()
+        store = self.store
+        session, management = self.session_generation, self.management_generation
+        context = self._collection_context()
+        self.pending_start = token
+        self._diagnostic('start_refresh_started', reason_code='AFTER_FORCED_IDENTITY')
+        self._update_buttons()
+
+        def resume():
+            if self.pending_start is not token:
+                return
+            self.pending_start = None
+            self._update_buttons()
+            try:
+                valid = (self.store is store and self.session_generation == session
+                         and self.management_generation == management
+                         and not self.busy and not self.observing and not self.automatic
+                         and not self.closing and not self.interrupting and not self.cleanup_failed
+                         and not self.audit_failed and not self.recovery_mode
+                         and not self.pending_login and self.pending_change is None
+                         and self.single_revoke_id is None and self.session_ready
+                         and self._collection_context() == context and self._collection_is_current())
+                if not valid:
+                    self._diagnostic('start_refresh_discarded', reason_code='CONTEXT_CHANGED')
+                    return
+                self._diagnostic('start_refresh_ready')
+                self.start()
+            except Exception as exc:
+                self.stop(quiet=True)
+                self.error('自动管理未开启', exc, dialog=False)
+
+        try:
+            self.collect(after_read=resume)
+        except Exception as exc:
+            # Local file/argument reads can fail before a browser task exists.
+            # Do not leave a pending start blocking the other controls.
+            if self.pending_start is token:
+                self.pending_start = None
+                self._update_buttons()
+            self.error('自动管理未开启', exc, dialog=False)
+            return
+        if self.busy and self.pending_start is token:
+            self.status_var.set('强制删除后需要更新 Key 列表与费用，正在使用当前登录会话重新读取；完成后再确认启动。可点击“停止管理”取消后续启动。')
+        elif self.pending_start is token:
+            self.pending_start = None
+            self._update_buttons()
+
     def stop(self, quiet=False):
-        was_running = self.observing or self.automatic or self.single_revoke_id is not None
+        was_running = self.observing or self.automatic or self.single_revoke_id is not None or self.pending_start is not None
+        if self.pending_start is not None:
+            self._diagnostic('start_refresh_cancelled')
+        self.pending_start = None
         self.observing = False
         self.automatic = False
         self.single_revoke_id = None
@@ -1486,16 +1601,20 @@ class App:
             return
         self._execute_revoke(targets[0])
 
-    def _current_revoke_target(self, row):
-        """Both entry points require the same fresh, quota-eligible ledger evidence."""
-        if (self.recovery_mode or not self.session_ready or not self._collection_is_current()
+    def _current_revoke_target(self, row, *, forced=False):
+        """Force uses verified identity; automatic management also needs quota evidence."""
+        if (self.recovery_mode or not self.session_ready or (not forced and not self._collection_is_current())
                 or self.store.workbook_hash() != self.validated_hash):
-            raise GuardError('身份、表格或费用核验已失效，请先重新读取费用；未执行删除。')
+            raise GuardError('身份或表格核验已失效；自动管理还需要有效费用核验。未执行删除。')
         if self.store.unresolved_actions():
             raise GuardError('有上次操作待核实，请先核实平台状态；未执行新的删除。')
         current = next((item for item in self.store.evaluate()
                         if item['name'] == row.get('name')
                         and item.get('tracking_id') == row.get('tracking_id')), None)
+        if forced:
+            if not current or not current.get('tracking_id') or current['status'] == 'retired':
+                raise GuardError('所选人员没有有效的当前 Key 绑定，未执行强制删除。')
+            return current
         if (not current or not eligible_for_automatic_action(current)
                 or (not self.collection_has_fees and current['amount'] != Decimal(0)
                     and current['share'] != Decimal(0))):
@@ -1530,42 +1649,84 @@ class App:
         self._browser_action('inspect_revoke', done, name=name, tracking_id=tracking_id)
 
     def revoke_selected_once(self):
-        """Delete only the selected eligible Key, using the automatic executor once."""
+        """Read fresh identity, then force only the selected Key without a quota gate."""
         if (not self.config or self.recovery_mode or self.busy or self.observing or self.automatic
                 or self.single_revoke_id is not None or self.pending_login or self.pending_change is not None
                 or self.closing or self.interrupting or self.cleanup_failed or self.audit_failed):
             return
         row = self.selected()
-        if not row or not row.get('tracking_id'):
-            self.status_var.set('请先选中已绑定且达到额度的人员，再执行单次自动删除。')
+        if not row or not row.get('name'):
+            self.error('尚未开始强制删除', '请先填写平台 Key 名称并选中对应人员，再执行强制删除。当前没有发出删除请求。')
+            return
+        if self.browser is None or getattr(self.browser, 'closed', False):
+            self.error('尚未开始强制删除', '请先点击登录，再强制删除所选 Key；不要求读取费用或达到额度。当前没有发出删除请求。')
             return
         try:
-            row = self._current_revoke_target(row)
+            if self.store.unresolved_actions():
+                raise GuardError('有上次操作待核实，请先核实平台状态；未执行新的删除。')
+            self.store.read_people()
+            fingerprint = self.store.workbook_hash()
+            config = self.store.load()
         except GuardError as exc:
-            self.error('未开始单次删除', exc, dialog=False)
+            self.error('未开始强制删除', exc, dialog=False)
             return
-        confirmation_generation = self.management_generation
-        confirmation_store = self.store
-        if not messagebox.askyesno('自动删除选中 Key（仅本次）',
-            f"人员：{row['name']}\n平台 Tracking ID：{row['tracking_id']}\n\n"
-            '该人员已达到额度。将自动永久删除这一枚 Key 并核实结果，无需再到网页逐项确认。\n'
-            '本次不处理其他人员，也不启动周期读取。删除不可恢复，在途费用仍可能入账。\n\n执行本次删除？', parent=self.root):
-            return
-        # The confirmation opens a nested Tk loop. Revalidate state and evidence
-        # after it closes, so login/stop/workbook changes cannot reuse this intent.
-        if (self.busy or self.observing or self.automatic or self.pending_login
-                or self.pending_change is not None or self.closing or self.interrupting
-                or self.cleanup_failed or self.audit_failed
-                or self.management_generation != confirmation_generation or self.store is not confirmation_store):
-            return
-        try:
-            self._execute_revoke(row, single=True)
-        except Exception as exc:
-            self.stop(quiet=True)
-            self.error('未开始单次删除', exc, dialog=False)
+        generation, session_generation = self.management_generation, self.session_generation
+        store = self.store
+        name, old_id = row['name'], row.get('tracking_id')
 
-    def _execute_revoke(self, row, *, single=False):
+        def unchanged():
+            return (not self.closing and not self.interrupting and not self.cleanup_failed
+                    and not self.audit_failed and not self.recovery_mode and not self.observing
+                    and not self.automatic and not self.pending_login and self.pending_change is None
+                    and self.single_revoke_id is None and self.store is store
+                    and self.management_generation == generation and self.session_generation == session_generation
+                    and store.workbook_hash() == fingerprint)
+
+        def confirm(target):
+            try:
+                if self.busy or not unchanged():
+                    return
+                if not messagebox.askyesno('强制删除选中 Key',
+                    f"人员：{name}\n平台 Tracking ID：{target['tracking_id']}\n\n"
+                    '将永久删除这一枚 Key，忽略个人额度、公共额度和累计费用；-1 也可强制删除。\n'
+                    '本次只处理所选 Key，不启动周期管理。删除不可恢复。\n\n确认强制删除？', parent=self.root):
+                    self._action_state('revoke', '已取消')
+                    return
+                if self.busy or not unchanged():
+                    return
+                self._execute_revoke(target, single=True, forced=True)
+            except Exception as exc:
+                self.stop(quiet=True)
+                self.error('未开始强制删除', exc, dialog=False)
+
+        def identity_ready(result):
+            if not unchanged():
+                raise GuardError('核验期间列表或会话变化，未执行强制删除。')
+            matches = [key for key in result['keys'] if key['name'] == name]
+            if len(matches) != 1 or (old_id and matches[0]['tracking_id'] != old_id):
+                raise GuardError('平台所选名称缺失、重名或 Tracking ID 已变化，未执行删除。')
+            target = matches[0]
+            self._claim_targets(result['keys'])
+            store.bind_forced_target(result['keys'], result['account_id'], name, target['tracking_id'])
+            self.config = store.load()
+            self._invalidate_collection()
+            self.start_refresh_required = True
+            self.session_ready = True
+            self.validated_hash = fingerprint
+            self.last_keys = result['keys']
+            self._action_state('login', '已核验')
+            self.refresh_rows()
+            # _browser_action releases busy in its finally block. Confirm only
+            # after that block, and recheck the captured target after the modal.
+            self.root.after(0, lambda: confirm(target))
+
+        self._browser_action('read_keys', identity_ready, account_id=config.account_id,
+                             known_keys=store.active_tracking_ids())
+
+    def _execute_revoke(self, row, *, single=False, forced=False):
         """Shared single-target executor; only the caller chooses polling or one-shot."""
+        if forced and not single:
+            raise GuardError('强制删除只允许用于用户选中的单枚 Key。')
         if (self.busy or self.closing or self.interrupting or self.cleanup_failed or self.audit_failed
                 or self.pending_login or self.pending_change is not None):
             return
@@ -1574,7 +1735,7 @@ class App:
                 return
         elif not self.automatic or not self.observing:
             return
-        row = self._current_revoke_target(row)
+        row = self._current_revoke_target(row, forced=forced)
         self._claim_targets(self.last_keys)
         if not self._target_is_claimed(row['tracking_id']):
             raise GuardError('当前目标未取得本机独占管理权，未建立撤销意图。')
@@ -1587,6 +1748,7 @@ class App:
         permit = DeletePermit()
         self.delete_permit = permit
         checked_hash = self.validated_hash
+        checked_session = self.session_generation
         operation_store = self.store
         operation_id = uuid4().hex
         if single:
@@ -1604,35 +1766,42 @@ class App:
         def record(status, detail, *, evidence=None):
             operation_store.record_action(row['name'], row['tracking_id'], status, detail,
                                           operation_id=operation_id, evidence=evidence,
+                                          intent='manual_force' if forced and status == 'pending' else None,
                                           continuation=status not in {'pending', 'requested'})
-        record('pending', '达到额度，准备通过控制台 HTTP 单次撤销；尚未进入提交步骤',
+        record('pending', ('用户选择强制删除，忽略额度与费用条件；' if forced else '达到额度，') +
+               '准备通过控制台 HTTP 单次撤销；尚未进入提交步骤',
                evidence=operation_store.action_evidence(row['name'], row['tracking_id']))
         verified_absence = False
         audit_recorded = False
 
+        def context_valid():
+            return (not self.closing and active() and operation_store is self.store
+                    and not self.recovery_mode and self._target_is_claimed(row['tracking_id'])
+                    and self.session_ready and self.session_generation == checked_session
+                    and (forced or self._collection_is_current())
+                    and operation_store.workbook_hash() == checked_hash)
+
         def authorize():
             if not permit.ready.is_set() or permit.decided.is_set():
                 return
-            if (self.closing or not active() or operation_store is not self.store
-                    or self.recovery_mode or not self._target_is_claimed(row['tracking_id'])
-                    or not self._collection_is_current() or operation_store.workbook_hash() != checked_hash):
+            if not context_valid():
                 permit.decide(False)
                 return
             current = next((r for r in operation_store.evaluate() if r['name'] == row['name']), None)
-            if (not current or not eligible_for_automatic_action(current)
-                    or current['tracking_id'] != row['tracking_id']):
+            if (not current or current['tracking_id'] != row['tracking_id'] or current['status'] == 'retired'
+                    or (not forced and not eligible_for_automatic_action(current))):
                 permit.decide(False)
                 return
             # Commit before the worker is allowed to click, including after a crash.
             evidence = operation_store.action_evidence(row['name'], row['tracking_id'])
-            if (evidence['workbook_hash'] != checked_hash or evidence['status'] != 'triggered'
-                    or not (evidence['complete'] or Decimal(evidence['amount']) == 0 or Decimal(evidence['share']) == 0)):
+            if (evidence['workbook_hash'] != checked_hash or (not forced and
+                    (evidence['status'] != 'triggered' or not (evidence['complete']
+                        or Decimal(evidence['amount']) == 0 or Decimal(evidence['share']) == 0)))):
                 permit.decide(False)
                 return
-            record('requested', '目标与额度已复核，控制台 HTTP 提交许可可能已发出；最终结果仍待平台核实', evidence=evidence)
-            if (self.closing or not active() or operation_store is not self.store
-                    or self.recovery_mode or not self._target_is_claimed(row['tracking_id'])
-                    or not self._collection_is_current() or operation_store.workbook_hash() != checked_hash):
+            record('requested', ('所选目标与强制删除意图已复核，未要求达到额度；' if forced else '目标与额度已复核，') +
+                   '控制台 HTTP 提交许可可能已发出；最终结果仍待平台核实', evidence=evidence)
+            if not context_valid():
                 permit.decide(False)
                 return
             permit.decide(True)
@@ -1656,7 +1825,8 @@ class App:
                     audit_recorded = True
                 self._action_state("revoke", "已确认不存在")
                 self.status_var.set(f"{row['name']}：平台列表中已不存在该 Key，处理记录已保存。" +
-                                    ("本次仅处理所选 Key，未启动周期读取。" if single else
+                                    ("本次仅处理所选 Key，未启动周期读取。点击启动全自动管理时，会在当前会话重新读取并核验，无需中断或重登录。" if single and forced else
+                                     "本次仅处理所选 Key，未启动周期读取。" if single else
                                      (("自动管理继续。" if self.collection_has_fees else "自动管理继续；费用未核验，仅零额度可处理。") if self.observing else "自动管理已停止。")))
             else:
                 if not audit_recorded:

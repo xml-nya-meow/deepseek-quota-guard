@@ -36,13 +36,19 @@ class OfflineBrowser:
 
 
 class ControlledBrowser(OfflineBrowser):
-    def __init__(self):
+    def __init__(self, *, identity_result=None):
         super().__init__({})
         self.futures = []
+        self.identity_result = identity_result
 
     def submit(self, action, **kwargs):
         self.calls.append((action, kwargs))
         future = Future()
+        if action == 'read_keys' and self.identity_result is not None:
+            # The identity read completes normally; only outstanding actions
+            # enter the queue controlled by each test.
+            future.set_result(self.identity_result)
+            return future
         self.futures.append(future)
         return future
 
@@ -104,6 +110,11 @@ class WorkflowTests(unittest.TestCase):
     def empty_collection(self, **overrides):
         result = self.valid_collection(totals=None, source_id='', message='暂无记录',
                                        reason_code='NO_USAGE_DATA', retryable=True)
+        result.update(overrides)
+        return result
+
+    def identity_result(self, **overrides):
+        result = {'keys': self.keys, 'account_id': key_fingerprint(self.keys)}
         result.update(overrides)
         return result
 
@@ -327,7 +338,7 @@ class WorkflowTests(unittest.TestCase):
         browser = ControlledBrowser(); self.app.browser = browser
         self.app.verify_revoke()
         date = (datetime.now(TZ).date() - timedelta(days=1)).isoformat()
-        with patch('quota_guard.ui.simpledialog.askstring', return_value=date):
+        with patch('quota_guard.ui.ask_text', return_value=date):
             self.app.change_start_date()
         self.assertEqual(self.app.folder, self.folder)
         browser.futures[0].set_result({'absent': True})
@@ -382,7 +393,7 @@ class WorkflowTests(unittest.TestCase):
     def test_template_cannot_overwrite_active_workbook(self):
         original = self.store.workbook_path.read_bytes()
         with patch('quota_guard.ui.filedialog.asksaveasfilename', return_value=str(self.store.workbook_path)), \
-                patch('quota_guard.ui.shutil.copyfile') as copy:
+                patch('quota_guard.ui.write_personnel_template') as copy:
             self.app.save_template()
         copy.assert_not_called()
         self.assertEqual(self.store.workbook_path.read_bytes(), original)
@@ -397,7 +408,9 @@ class WorkflowTests(unittest.TestCase):
         with patch('quota_guard.ui.sys._MEIPASS', str(runtime), create=True), \
                 patch('quota_guard.ui.filedialog.asksaveasfilename', return_value=str(output)):
             self.app.save_template()
-        self.assertEqual(output.read_bytes(), template.read_bytes())
+        from quota_guard.excel_io import read_people_workbook
+        self.assertEqual(read_people_workbook(output), [Person('', Decimal(-1)) for _ in range(14)])
+        self.assertEqual(template.read_bytes(), original)
         self.assertEqual(self.store.workbook_path.read_bytes(), original)
 
     def test_relogin_clears_unused_initial_binding_but_preserves_real_billing(self):
@@ -696,15 +709,17 @@ class WorkflowTests(unittest.TestCase):
         self.assertIsNone(self.store.latest_action('test-key-b'))
         self.assertIn('仅零额度可处理', self.app.status_var.get())
 
-    def test_diagnostic_log_folder_can_open_during_pending_work(self):
+    def test_diagnostic_viewer_can_open_during_pending_work(self):
         self.app.browser = ControlledBrowser()
         self.app.collect()
         self.assertEqual(str(self.app.buttons['diagnostics'].cget('state')), 'normal')
         with patch('quota_guard.ui.os.startfile') as startfile:
             self.app.buttons['diagnostics'].invoke()
-        startfile.assert_called_once_with(str(self.app.diagnostics_dir))
+        startfile.assert_not_called()
+        self.assertTrue(self.app._diagnostics_window.winfo_exists())
+        self.assertEqual(self.app._diagnostics_window.title(), '运行诊断日志')
         self.assertTrue(self.app.busy)
-        self.assertIn('已完成', self.app.buttons['diagnostics'].cget('text'))
+        self.assertIn('已打开', self.app.buttons['diagnostics'].cget('text'))
 
     def test_closed_browser_with_confirmed_cleanup_can_be_replaced(self):
         old = ControlledBrowser(); old.closed = True; old.cleanup_failed = False
@@ -1100,67 +1115,185 @@ class WorkflowTests(unittest.TestCase):
         self.app.browser = OfflineBrowser({'collect': self.valid_collection(
             totals={'test-key-a': Decimal(0), 'test-key-b': Decimal('0.2')})})
         self.app.collect(); self.pump()
-        browser = ControlledBrowser(); self.app.browser = browser
+        browser = ControlledBrowser(identity_result=self.identity_result()); self.app.browser = browser
         self.app.tree.selection_set('1')
-        self.app.revoke_selected_once()
+        self.app.revoke_selected_once(); self.pump()
         self.assertFalse(self.app.automatic)
         self.assertFalse(self.app.observing)
         self.assertIsNotNone(self.app.single_revoke_id)
         self.assertEqual(str(self.app.buttons['stop'].cget('state')), 'normal')
-        permit = browser.calls[0][1]['permit']
-        self.assertEqual(browser.calls[0][1]['tracking_id'], 'test-key-b')
-        self.assertTrue(browser.calls[0][1]['target_lock_names'])
+        self.assertEqual(browser.calls[0][0], 'read_keys')
+        permit = browser.calls[1][1]['permit']
+        self.assertEqual(browser.calls[1][1]['tracking_id'], 'test-key-b')
+        self.assertTrue(browser.calls[1][1]['target_lock_names'])
         self.assertEqual(self.store.latest_action('test-key-b'), 'pending')
+        pending = self.store.latest_action_record('test-key-b')
+        self.assertEqual(pending['intent'], 'manual_force')
         permit.ready.set(); self.pump()
         self.assertTrue(permit.allowed)
         self.assertEqual(self.store.latest_action('test-key-b'), 'requested')
         browser.futures[0].set_result({'absent': True}); self.pump(); self.pump()
         self.assertEqual(self.store.latest_action('test-key-b'), 'absent_verified')
         self.assertIsNone(self.store.latest_action('test-key-a'))
-        self.assertEqual([a for a, _ in browser.calls], ['revoke'])
+        self.assertEqual([a for a, _ in browser.calls], ['read_keys', 'revoke'])
         self.assertIsNone(self.app.timer)
         self.assertIsNone(self.app.single_revoke_id)
-        self.assertIn('仅本次', self.app.buttons['revoke'].cget('text'))
+        self.assertIn('强制删除', self.app.buttons['revoke'].cget('text'))
         self.assertIn('已确认不存在', self.app.buttons['revoke'].cget('text'))
         self.assertIn('未启动周期读取', self.app.status_var.get())
+        completed = self.store.latest_action_record('test-key-b')
+        self.assertEqual(completed['intent'], 'manual_force')
+        self.assertEqual(completed['operation_id'], pending['operation_id'])
 
-    def test_single_delete_rejects_under_budget_skipped_and_unknown_positive(self):
-        cases = [('below', Decimal(80), {'test-key-b': Decimal(5)}),
-                 ('skip', Decimal(-1), {'test-key-b': Decimal(100)}),
-                 ('unknown', Decimal(80), None)]
-        for source, quota, totals in cases:
-            with self.subTest(source=source):
-                self.store.save_people([Person('测试甲', Decimal(0)), Person('测试乙', quota)])
-                result = (self.empty_collection() if totals is None else
-                          self.valid_collection(totals=totals, source_id=source))
-                browser = OfflineBrowser({'collect': result}); self.app.browser = browser
+    def assert_force_allowed(self, quota, *, totals=None, stale=False, collect=True):
+        """Quota evidence is retained as fact, never converted into permission."""
+        self.store.save_people([Person('测试甲', Decimal(100)), Person('测试乙', quota)])
+        self.app.refresh_rows()
+        if collect:
+            self.app.browser = OfflineBrowser({'collect': (
+                self.empty_collection() if totals is None else self.valid_collection(totals=totals))})
+            self.app.collect(); self.pump()
+        if stale:
+            self.app.collection_observed_monotonic -= COLLECTION_MAX_AGE_SECONDS + 1
+        before = next(row for row in self.store.evaluate() if row['name'] == '测试乙')
+        browser = ControlledBrowser(identity_result=self.identity_result()); self.app.browser = browser
+        self.app.tree.selection_set('1')
+        self.app.revoke_selected_once(); self.pump()
+        self.assertEqual([a for a, _ in browser.calls], ['read_keys', 'revoke'])
+        permit = browser.calls[1][1]['permit']
+        permit.ready.set(); self.pump()
+        self.assertTrue(permit.allowed)
+        event = self.store.latest_action_record('test-key-b')
+        self.assertEqual(event['status'], 'requested')
+        self.assertEqual(event['intent'], 'manual_force')
+        self.assertEqual(Decimal(event['evidence']['amount']), quota)
+        self.assertEqual(event['evidence']['spent'],
+                         None if before['spent'] is None else str(before['spent']))
+        self.assertEqual(event['evidence']['status'], before['status'])
+        self.assertFalse(self.app._collection_is_current())
+        browser.futures[0].set_result({'absent': True}); self.pump()
+        self.assertEqual(self.store.latest_action('test-key-b'), 'absent_verified')
+        self.assertIsNone(self.store.latest_action('test-key-a'))
+        self.assertFalse(self.app.automatic)
+        self.assertFalse(self.app.observing)
+        self.assertIsNone(self.app.timer)
+
+    def test_single_delete_allows_under_budget_without_faking_trigger(self):
+        self.assert_force_allowed(Decimal(80), totals={'test-key-b': Decimal(5)})
+
+    def test_single_delete_binds_skipped_target_and_ignores_skip_quota(self):
+        self.assert_force_allowed(Decimal(-1), collect=False)
+
+    def test_single_delete_allows_unknown_cost_without_reading_fees(self):
+        self.assert_force_allowed(Decimal(80), collect=False)
+
+    def test_single_delete_allows_expired_fee_evidence_after_fresh_identity_read(self):
+        self.assert_force_allowed(Decimal(80), totals={'test-key-b': Decimal(5)}, stale=True)
+
+    def test_automatic_delete_still_rejects_under_budget_skipped_and_unknown(self):
+        for quota, totals in ((Decimal(80), {'test-key-b': Decimal(5)}),
+                              (Decimal(-1), {'test-key-b': Decimal(100)}),
+                              (Decimal(80), None)):
+            with self.subTest(quota=quota, totals=totals):
+                self.store.save_people([Person('测试甲', Decimal(1000)), Person('测试乙', quota)])
+                self.app.browser = OfflineBrowser({'collect': (
+                    self.empty_collection() if totals is None else
+                    self.valid_collection(totals=totals, source_id=str(quota)))})
                 self.app.collect(); self.pump()
-                self.app.tree.selection_set('1')
-                self.app.revoke_selected_once(); self.pump()
-                self.assertEqual([a for a, _ in browser.calls], ['collect'])
+                row = next(row for row in self.app.rows if row['name'] == '测试乙')
+                with self.assertRaises(GuardError):
+                    self.app._current_revoke_target(row)
                 self.assertIsNone(self.store.latest_action('test-key-b'))
+
+    def test_automatic_delete_still_rejects_expired_fee_evidence(self):
+        self.prime_verified_session()
+        self.app.collection_observed_monotonic -= COLLECTION_MAX_AGE_SECONDS + 1
+        with self.assertRaises(GuardError):
+            self.app._current_revoke_target(self.app.rows[0])
 
     def test_single_delete_revalidates_workbook_after_target_confirmation(self):
         self.prime_verified_session()
-        browser = ControlledBrowser(); self.app.browser = browser
+        browser = ControlledBrowser(identity_result=self.identity_result()); self.app.browser = browser
         self.app.tree.selection_set('0')
         def change_workbook(*args, **kwargs):
             self.store.save_people([Person('测试甲', Decimal(-1)), Person('测试乙', Decimal(80))])
             return True
         with patch('quota_guard.ui.messagebox.askyesno', side_effect=change_workbook):
-            self.app.revoke_selected_once()
-        self.assertEqual(browser.calls, [])
+            self.app.revoke_selected_once(); self.pump()
+        self.assertEqual([a for a, _ in browser.calls], ['read_keys'])
         self.assertIsNone(self.store.latest_action('test-key-a'))
         self.assertIsNone(self.app.single_revoke_id)
 
-    def test_single_delete_rejects_expired_evidence_and_unresolved_other_target(self):
+    def test_single_delete_rejects_fresh_list_replacing_bound_tracking_id(self):
+        self.prime_verified_session()
+        changed = [{'name': '测试甲', 'tracking_id': 'replacement-key'}, self.keys[1]]
+        browser = ControlledBrowser(identity_result=self.identity_result(keys=changed))
+        self.app.browser = browser
+        self.app.tree.selection_set('0'); self.app.revoke_selected_once(); self.pump()
+        self.assertEqual([a for a, _ in browser.calls], ['read_keys'])
+        self.assertIsNone(self.store.latest_action('test-key-a'))
+        self.assertIsNone(self.store.latest_action('replacement-key'))
+        self.assertEqual(self.store.evaluate()[0]['tracking_id'], 'test-key-a')
+
+    def test_single_delete_rejects_ambiguous_fresh_target_name(self):
+        self.prime_verified_session()
+        ambiguous = self.keys + [{'name': '测试甲', 'tracking_id': 'duplicate-name-key'}]
+        browser = ControlledBrowser(identity_result=self.identity_result(keys=ambiguous))
+        self.app.browser = browser
+        self.app.tree.selection_set('0'); self.app.revoke_selected_once(); self.pump()
+        self.assertEqual([a for a, _ in browser.calls], ['read_keys'])
+        self.assertIsNone(self.store.latest_action('test-key-a'))
+
+    def test_single_delete_rejects_fresh_identity_from_other_account(self):
+        self.prime_verified_session()
+        browser = ControlledBrowser(identity_result=self.identity_result(account_id='other-account'))
+        self.app.browser = browser
+        self.app.tree.selection_set('0'); self.app.revoke_selected_once(); self.pump()
+        self.assertEqual([a for a, _ in browser.calls], ['read_keys'])
+        self.assertIsNone(self.store.latest_action('test-key-a'))
+        self.assertEqual(self.store.load().account_id, key_fingerprint(self.keys))
+
+    def test_single_delete_stop_during_identity_read_cannot_grant_intent(self):
         self.prime_verified_session()
         browser = ControlledBrowser(); self.app.browser = browser
-        self.app.tree.selection_set('0')
-        self.app.collection_observed_monotonic -= COLLECTION_MAX_AGE_SECONDS + 1
-        self.app.revoke_selected_once()
-        self.assertEqual(browser.calls, [])
+        self.app.tree.selection_set('0'); self.app.revoke_selected_once()
+        self.assertEqual([a for a, _ in browser.calls], ['read_keys'])
+        self.app.stop(quiet=True)
+        browser.futures[0].set_result(self.identity_result()); self.pump()
+        self.assertEqual([a for a, _ in browser.calls], ['read_keys'])
+        self.assertIsNone(self.store.latest_action('test-key-a'))
+
+    def test_single_delete_workbook_change_during_identity_read_cannot_grant_intent(self):
         self.prime_verified_session()
+        browser = ControlledBrowser(); self.app.browser = browser
+        self.app.tree.selection_set('0'); self.app.revoke_selected_once()
+        self.store.save_people([Person('测试甲', Decimal(-1)), Person('测试乙', Decimal(80))])
+        browser.futures[0].set_result(self.identity_result()); self.pump()
+        self.assertEqual([a for a, _ in browser.calls], ['read_keys'])
+        self.assertIsNone(self.store.latest_action('test-key-a'))
+
+    def test_single_delete_identity_read_failure_never_creates_pending_action(self):
+        self.prime_verified_session()
+        browser = ControlledBrowser(); self.app.browser = browser
+        self.app.tree.selection_set('0'); self.app.revoke_selected_once()
+        browser.futures[0].set_exception(GuardError('fixture identity read failed')); self.pump()
+        self.assertEqual([a for a, _ in browser.calls], ['read_keys'])
+        self.assertIsNone(self.store.latest_action('test-key-a'))
+        self.assertIsNone(self.app.single_revoke_id)
+
+    def test_single_delete_cancel_target_confirmation_never_creates_intent(self):
+        self.prime_verified_session()
+        browser = ControlledBrowser(identity_result=self.identity_result()); self.app.browser = browser
+        self.app.tree.selection_set('0')
+        with patch('quota_guard.ui.messagebox.askyesno', return_value=False):
+            self.app.revoke_selected_once(); self.pump()
+        self.assertEqual([a for a, _ in browser.calls], ['read_keys'])
+        self.assertIsNone(self.store.latest_action('test-key-a'))
+        self.assertIsNone(self.app.single_revoke_id)
+
+    def test_single_delete_rejects_unresolved_other_target(self):
+        self.prime_verified_session()
+        browser = ControlledBrowser(identity_result=self.identity_result())
         self.store.record_action('测试乙', 'test-key-b', 'requested', 'other uncertain operation')
         self.app.browser = browser
         self.app.tree.selection_set('0')
@@ -1170,9 +1303,9 @@ class WorkflowTests(unittest.TestCase):
 
     def test_single_delete_stop_before_permit_never_records_requested(self):
         self.prime_verified_session()
-        browser = ControlledBrowser(); self.app.browser = browser
-        self.app.tree.selection_set('0'); self.app.revoke_selected_once()
-        permit = browser.calls[0][1]['permit']
+        browser = ControlledBrowser(identity_result=self.identity_result()); self.app.browser = browser
+        self.app.tree.selection_set('0'); self.app.revoke_selected_once(); self.pump()
+        permit = browser.calls[1][1]['permit']
         self.app.stop()
         permit.ready.set(); self.pump()
         self.assertTrue(permit.decided.is_set())
@@ -1183,13 +1316,13 @@ class WorkflowTests(unittest.TestCase):
                              if e['kind'] == 'action'))
         self.assertIsNone(self.app.single_revoke_id)
         self.assertIsNone(self.app.timer)
-        self.assertEqual([a for a, _ in browser.calls], ['revoke'])
+        self.assertEqual([a for a, _ in browser.calls], ['read_keys', 'revoke'])
 
     def test_single_delete_stop_after_permit_keeps_result_without_polling(self):
         self.prime_verified_session()
-        browser = ControlledBrowser(); self.app.browser = browser
-        self.app.tree.selection_set('0'); self.app.revoke_selected_once()
-        permit = browser.calls[0][1]['permit']
+        browser = ControlledBrowser(identity_result=self.identity_result()); self.app.browser = browser
+        self.app.tree.selection_set('0'); self.app.revoke_selected_once(); self.pump()
+        permit = browser.calls[1][1]['permit']
         permit.ready.set(); self.pump()
         self.assertTrue(permit.allowed)
         self.app.stop()
@@ -1199,29 +1332,29 @@ class WorkflowTests(unittest.TestCase):
         self.assertFalse(self.app.observing)
         self.assertIsNone(self.app.timer)
         self.assertIsNone(self.app.single_revoke_id)
-        self.assertEqual([a for a, _ in browser.calls], ['revoke'])
+        self.assertEqual([a for a, _ in browser.calls], ['read_keys', 'revoke'])
 
     def test_single_delete_respects_public_quota_trigger(self):
         self.store.save_people([Person('测试甲', Decimal(1000)), Person('测试乙', Decimal(-1))])
         self.app.browser = OfflineBrowser({'collect': self.valid_collection(
             totals={'test-key-a': Decimal(107), 'test-key-b': Decimal(0)})})
         self.app.collect(); self.pump()
-        browser = ControlledBrowser(); self.app.browser = browser
-        self.app.tree.selection_set('0'); self.app.revoke_selected_once()
-        permit = browser.calls[0][1]['permit']
+        browser = ControlledBrowser(identity_result=self.identity_result()); self.app.browser = browser
+        self.app.tree.selection_set('0'); self.app.revoke_selected_once(); self.pump()
+        permit = browser.calls[1][1]['permit']
         permit.ready.set(); self.pump()
         self.assertTrue(permit.allowed)
         browser.futures[0].set_result({'absent': True}); self.pump()
         self.assertEqual(self.store.latest_action('test-key-a'), 'absent_verified')
         self.assertIsNone(self.store.latest_action('test-key-b'))
-        self.assertEqual([a for a, _ in browser.calls], ['revoke'])
+        self.assertEqual([a for a, _ in browser.calls], ['read_keys', 'revoke'])
 
     def test_single_delete_interrupt_preserves_unknown_and_clears_single_permission(self):
         self.prime_verified_session()
-        browser = ControlledBrowser(); browser.cleanup_future = Future()
+        browser = ControlledBrowser(identity_result=self.identity_result()); browser.cleanup_future = Future()
         self.app.browser = browser
-        self.app.tree.selection_set('0'); self.app.revoke_selected_once()
-        permit = browser.calls[0][1]['permit']
+        self.app.tree.selection_set('0'); self.app.revoke_selected_once(); self.pump()
+        permit = browser.calls[1][1]['permit']
         permit.ready.set(); self.pump()
         self.assertTrue(permit.allowed)
         self.app.interrupt_operation(); self.pump()
@@ -1233,13 +1366,13 @@ class WorkflowTests(unittest.TestCase):
         browser.cleanup_future.set_result(None); self.pump()
         self.assertFalse(self.app.interrupting)
         self.assertFalse(self.app.session_ready)
-        self.assertEqual([a for a, _ in browser.calls], ['revoke'])
+        self.assertEqual([a for a, _ in browser.calls], ['read_keys', 'revoke'])
 
     def test_single_delete_preparation_failure_is_not_submitted_and_not_retried(self):
         from quota_guard.revocation_permit import RevocationNotSubmitted
         self.prime_verified_session()
-        browser = ControlledBrowser(); self.app.browser = browser
-        self.app.tree.selection_set('0'); self.app.revoke_selected_once()
+        browser = ControlledBrowser(identity_result=self.identity_result()); self.app.browser = browser
+        self.app.tree.selection_set('0'); self.app.revoke_selected_once(); self.pump()
         failure = RevocationNotSubmitted()
         browser.futures[0].set_exception(failure); self.pump(); self.pump()
         event = self.store.latest_action_record('test-key-a')
@@ -1249,13 +1382,13 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('准备失败，未提交', self.app.buttons['revoke'].cget('text'))
         self.assertIsNone(self.app.single_revoke_id)
         self.assertIsNone(self.app.timer)
-        self.assertEqual([a for a, _ in browser.calls], ['revoke'])
+        self.assertEqual([a for a, _ in browser.calls], ['read_keys', 'revoke'])
 
     def test_single_delete_unknown_then_present_does_not_authorize_retry(self):
         self.prime_verified_session()
-        browser = ControlledBrowser(); self.app.browser = browser
-        self.app.tree.selection_set('0'); self.app.revoke_selected_once()
-        permit = browser.calls[0][1]['permit']
+        browser = ControlledBrowser(identity_result=self.identity_result()); self.app.browser = browser
+        self.app.tree.selection_set('0'); self.app.revoke_selected_once(); self.pump()
+        permit = browser.calls[1][1]['permit']
         permit.ready.set(); self.pump()
         browser.futures[0].set_result({'absent': False}); self.pump()
         self.assertEqual(self.store.latest_action('test-key-a'), 'unknown_result')
@@ -1265,22 +1398,22 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('列表存在不代表 Key 可调用', self.app.status_var.get())
         self.app.tree.selection_set('0'); self.app.revoke_selected_once(); self.pump()
         self.assertTrue(self.store.unresolved_actions())
-        self.assertEqual([a for a, _ in browser.calls], ['revoke', 'verify_revoke'])
+        self.assertEqual([a for a, _ in browser.calls], ['read_keys', 'revoke', 'verify_revoke'])
         self.assertFalse(self.app.automatic)
 
     def test_single_delete_login_waits_for_recorded_outcome(self):
         self.prime_verified_session()
-        browser = ControlledBrowser(); self.app.browser = browser
-        self.app.tree.selection_set('0'); self.app.revoke_selected_once()
-        permit = browser.calls[0][1]['permit']
+        browser = ControlledBrowser(identity_result=self.identity_result()); self.app.browser = browser
+        self.app.tree.selection_set('0'); self.app.revoke_selected_once(); self.pump()
+        permit = browser.calls[1][1]['permit']
         permit.ready.set(); self.pump()
         self.assertTrue(permit.allowed)
         self.app.login(); self.pump()
-        self.assertEqual([a for a, _ in browser.calls], ['revoke'])
+        self.assertEqual([a for a, _ in browser.calls], ['read_keys', 'revoke'])
         self.assertIsNone(self.app.single_revoke_id)
         browser.futures[0].set_result({'absent': True}); self.pump()
         self.assertEqual(self.store.latest_action('test-key-a'), 'absent_verified')
-        self.assertEqual([a for a, _ in browser.calls], ['revoke', 'login'])
+        self.assertEqual([a for a, _ in browser.calls], ['read_keys', 'revoke', 'login'])
         self.assertFalse(self.app.automatic)
         self.assertIsNone(self.app.timer)
 

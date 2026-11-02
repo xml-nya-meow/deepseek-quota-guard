@@ -1,10 +1,10 @@
-"""A rejected newer fee read cannot turn historical costs into new permission."""
+"""Rejected fees cannot grant quota permission; explicit force stays independent."""
 from decimal import Decimal
 import time
 import unittest
 
 import test_workflow as fixtures
-from quota_guard.core import Person
+from quota_guard.core import GuardError, Person
 from quota_guard.ui import COLLECTION_MAX_AGE_SECONDS
 
 
@@ -14,6 +14,7 @@ class FeeFailureEligibilityTests(unittest.TestCase):
     pump = fixtures.WorkflowTests.pump
     valid_collection = fixtures.WorkflowTests.valid_collection
     empty_collection = fixtures.WorkflowTests.empty_collection
+    identity_result = fixtures.WorkflowTests.identity_result
     prime_verified_session = fixtures.WorkflowTests.prime_verified_session
 
     def persisted_fees(self):
@@ -43,19 +44,36 @@ class FeeFailureEligibilityTests(unittest.TestCase):
         self.assertEqual(self.persisted_fees(), before)
         return browser, before
 
-    def test_unsupported_latest_read_blocks_single_and_periodic_positive_permission(self):
+    def test_unsupported_latest_read_blocks_periodic_but_allows_explicit_force(self):
         browser, before = self.accept_positive_then_reject_newer_read()
         current = next(row for row in self.store.evaluate() if row['name'] == '测试甲')
         self.assertEqual(current['spent'], Decimal('0.000011'))
         self.assertEqual(current['status'], 'triggered')  # Historical fee display remains truthful.
-        self.app.tree.selection_set('0')
-        self.app.revoke_selected_once(); self.pump()
         self.app.start(); self.pump(); self.pump()
         self.assertEqual([action for action, _ in browser.calls], ['collect'])
         self.assertIsNone(self.app.delete_permit)
         self.assertFalse(self.app.automatic)
         self.assertFalse(any(event['kind'] == 'action' for event in self.store.events()))
         self.assertEqual(self.persisted_fees(), before)  # Includes original DB snapshot timestamp.
+
+        browser = fixtures.ControlledBrowser(identity_result=self.identity_result())
+        self.app.browser = browser
+        self.app.tree.selection_set('0'); self.app.revoke_selected_once(); self.pump()
+        self.assertEqual([action for action, _ in browser.calls], ['read_keys', 'revoke'])
+        permit = browser.calls[1][1]['permit']
+        permit.ready.set(); self.pump()
+        self.assertTrue(permit.allowed)
+        event = self.store.latest_action_record('test-key-a')
+        self.assertEqual(event['status'], 'requested')
+        self.assertEqual(event['intent'], 'manual_force')
+        self.assertEqual(Decimal(event['evidence']['spent']), Decimal('0.000011'))
+        self.assertFalse(self.app.collection_has_fees)
+        self.assertIsNone(self.app.collection_observed_wall)
+        self.assertIsNone(self.app.collection_observed_monotonic)
+        self.assertEqual(self.persisted_fees(), before)
+        browser.futures[0].set_result({'absent': True}); self.pump()
+        self.assertEqual(self.store.latest_action('test-key-a'), 'absent_verified')
+        self.assertEqual(self.persisted_fees(), before)
 
     def test_readonly_preflight_does_not_restore_rejected_positive_fee_eligibility(self):
         _browser, before = self.accept_positive_then_reject_newer_read()
@@ -69,11 +87,28 @@ class FeeFailureEligibilityTests(unittest.TestCase):
         self.assertEqual(self.app.action_states['inspect'], '准备通过')
         self.assertFalse(self.app.collection_has_fees)
         self.assertEqual((self.app.collection_observed_wall, self.app.collection_observed_monotonic), read_clocks)
-        self.app.tree.selection_set('0'); self.app.revoke_selected_once(); self.pump()
+        with self.assertRaises(GuardError):
+            self.app._current_revoke_target(self.app.rows[0])
         self.assertEqual([action for action, _ in browser.calls], ['inspect_revoke'])
         self.assertIsNone(self.app.delete_permit)
         self.assertEqual(self.persisted_fees(), before)
         self.assertFalse(any(event['kind'] == 'action' for event in self.store.events()))
+
+        # Force obtains its own fresh identity check. Neither preflight nor
+        # identity-only reading may refresh the rejected fee observation.
+        browser = fixtures.ControlledBrowser(identity_result=self.identity_result())
+        self.app.browser = browser
+        self.app.tree.selection_set('0'); self.app.revoke_selected_once(); self.pump()
+        permit = browser.calls[1][1]['permit']
+        permit.ready.set(); self.pump()
+        self.assertTrue(permit.allowed)
+        self.assertEqual(self.store.latest_action_record('test-key-a')['intent'], 'manual_force')
+        self.assertFalse(self.app.collection_has_fees)
+        self.assertIsNone(self.app.collection_observed_wall)
+        self.assertIsNone(self.app.collection_observed_monotonic)
+        self.assertFalse(self.app._collection_is_current())
+        self.assertEqual(self.persisted_fees(), before)
+        browser.futures[0].set_result({'absent': True}); self.pump()
 
     def test_unsupported_latest_read_keeps_zero_and_skip_rules_without_new_snapshot(self):
         self.store.save_people([Person('测试甲', Decimal(0)),
@@ -94,6 +129,7 @@ class FeeFailureEligibilityTests(unittest.TestCase):
                          ['test-key-a'])
         self.assertIsNone(self.store.latest_action('test-key-b'))
         self.assertIsNone(self.store.latest_action('test-key-skip'))
+        self.assertNotIn('intent', self.store.latest_action_record('test-key-a'))
         self.assertEqual(next(row for row in self.store.evaluate() if row['name'] == '跳过人员')['status'], 'skipped')
         self.assertEqual(self.persisted_fees(), before)
         self.assertFalse(self.app.automatic)
@@ -114,16 +150,26 @@ class FeeFailureEligibilityTests(unittest.TestCase):
         self.app.tree.selection_set('0'); self.app.revoke_selected_once()
         self.assertTrue(self.app.busy)
         self.app.inspect_revoke(); self.app.revoke_selected_once(); self.app.start(); self.app.collect()
-        self.assertEqual([action for action, _ in browser.calls], ['inspect_revoke', 'revoke'])
+        self.assertEqual([action for action, _ in browser.calls], ['inspect_revoke', 'read_keys'])
+        self.assertIsNone(self.app.delete_permit)
+        browser.futures[1].set_result(self.identity_result()); self.pump()
+        self.assertTrue(self.app.busy)
+        self.app.inspect_revoke(); self.app.revoke_selected_once(); self.app.start(); self.app.collect()
+        self.assertEqual([action for action, _ in browser.calls], ['inspect_revoke', 'read_keys', 'revoke'])
         self.app.stop(quiet=True)
-        browser.futures[1].set_result({'cancelled': True}); self.pump()
+        browser.futures[2].set_result({'cancelled': True}); self.pump()
 
+        # Force intentionally invalidated quota freshness. A real new fee read
+        # is required before periodic management can resume.
+        self.app.collect()
+        browser.futures[3].set_result(self.empty_collection()); self.pump()
         self.app.start(); self.pump()
         self.assertTrue(self.app.busy)
         self.app.inspect_revoke(); self.app.revoke_selected_once(); self.app.start(); self.app.collect()
-        self.assertEqual([action for action, _ in browser.calls], ['inspect_revoke', 'revoke', 'revoke'])
+        self.assertEqual([action for action, _ in browser.calls],
+                         ['inspect_revoke', 'read_keys', 'revoke', 'collect', 'revoke'])
         self.app.stop(quiet=True)
-        browser.futures[2].set_result({'cancelled': True}); self.pump()
+        browser.futures[4].set_result({'cancelled': True}); self.pump()
 
 
 if __name__ == '__main__':

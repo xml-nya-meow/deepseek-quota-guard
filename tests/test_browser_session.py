@@ -51,6 +51,11 @@ class BrowserSessionTests(unittest.TestCase):
         environment = patch.dict(os.environ)
         environment.start()
         self.addCleanup(environment.stop)
+        # These lifecycle tests mock the driver itself, so keep them independent
+        # of the host's current local TCP permissions as well.
+        loopback = patch('quota_guard.browser_service.check_browser_loopback')
+        loopback.start()
+        self.addCleanup(loopback.stop)
 
     def install_stack(self, stack):
         self.service.pw = stack.playwright

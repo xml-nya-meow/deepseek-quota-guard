@@ -108,7 +108,8 @@ class PollSchedulingTests(unittest.TestCase):
         app.automatic = app.observing = True
         app.busy = app.closing = app.recovery_mode = app.interrupting = False
         app.cleanup_failed = app.audit_failed = app.pending_login = False
-        app.pending_change = app.single_revoke_id = app.delete_permit = None
+        app.pending_change = app.single_revoke_id = app.delete_permit = app.pending_start = None
+        app.start_refresh_required = False
         app.action_states = {}
         app.collect = Mock()
         app._update_buttons = Mock()

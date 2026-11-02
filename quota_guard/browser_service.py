@@ -19,7 +19,8 @@ import sys
 import time
 import uuid
 
-from .core import AccountMismatch, GuardError, clean_name
+from .core import AccountMismatch, GuardError, _identifier, clean_name
+from .browser_startup import BrowserStartupError, check_browser_loopback
 from .cost_parser import NoUsageData, parse_cost_response
 from .page_notices import (dismiss_optional_notice, install_optional_notice_handler,
                            raise_optional_notice_error)
@@ -59,6 +60,22 @@ _TRASH_BUTTON_JS = r"""(node, signatures) => {
 DELETE_WARNING = '该 API key 将立即被禁用。使用此密钥发出的 API 请求将被拒绝，这可能会导致仍然依赖它的任何系统崩溃。 一旦删除，你将无法再查看或修改此 API key。'
 
 UUID_PATTERN = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
+
+
+def identity_read_args(value):
+    """Copy the narrow read-only identity request at both process boundaries."""
+    if not isinstance(value, dict) or set(value) - {'account_id', 'known_keys'}:
+        raise GuardError('只读 Key 核验参数无效。')
+    account = value.get('account_id', '')
+    known = value.get('known_keys', ())
+    if (not isinstance(account, str) or (account and _identifier(account) != account)
+            or not isinstance(known, (list, tuple, set, frozenset))
+            or any(not isinstance(key, str) or not UUID_PATTERN.fullmatch(key) for key in known)):
+        raise GuardError('只读 Key 核验身份参数无效。')
+    if len({key.lower() for key in known}) != len(known):
+        raise GuardError('只读 Key 核验包含重复身份。')
+    return {'account_id': account, 'known_keys': tuple(sorted(known))}
+
 
 # Read only the name and explicitly identified Tracking ID field. In particular,
 # never collect the contents or copy label of the separate secret Key column.
@@ -246,7 +263,7 @@ class BrowserService:
                 self._log('browser_action_started', action=action, pid=os.getpid(), args=args)
                 entered_action = False
                 try:
-                    if action not in ('login', 'collect', 'prepare_revoke', 'inspect_revoke', 'verify_revoke', 'revoke', 'selftest'):
+                    if action not in ('login', 'collect', 'read_keys', 'prepare_revoke', 'inspect_revoke', 'verify_revoke', 'revoke', 'selftest'):
                         raise GuardError('不支持的浏览器动作。')
                     if action != 'login':
                         self._ensure_browser()
@@ -257,6 +274,10 @@ class BrowserService:
                     self._log('browser_action_finished', action=action, success=True, result=result)
                     future.set_result(result)
                 except Exception as exc:
+                    if action == 'read_keys':
+                        self.anchor = None
+                        self.known_keys = set()
+                        self._last_key_snapshot = None
                     if action == 'revoke' and not entered_action:
                         exc = RevocationNotSubmitted(reason_code='KEY_SESSION_UNAVAILABLE')
                     if action == 'inspect_revoke':
@@ -315,11 +336,19 @@ class BrowserService:
             bundled = root.parent / 'browser-runtime'  # Existing local work copy.
         if bundled.is_dir():
             os.environ['PLAYWRIGHT_BROWSERS_PATH'] = str(bundled)
+        self._stage('正在检查本机浏览器通信', phase='loopback')
+        try:
+            check_browser_loopback()
+        except BrowserStartupError as exc:
+            self._log('browser_startup_failed', phase='loopback',
+                      reason_code=exc.reason_code, error_code=exc.error_code)
+            raise
         from playwright.sync_api import sync_playwright
+        self._stage('正在初始化浏览器驱动', phase='driver')
         self.pw = sync_playwright().start()
-        self._stage('正在启动独立浏览器')
+        self._stage('正在启动独立浏览器', phase='chromium')
         # Ephemeral context: no password, token or login state saved to a file.
-        self.browser = self.pw.chromium.launch(headless=False)
+        self.browser = self.pw.chromium.launch(headless=False, timeout=30000)
         self.context = self.browser.new_context(locale='zh-CN', timezone_id='Asia/Shanghai', accept_downloads=True)
         self.page = self.context.new_page()
         self.page.set_default_timeout(12000)
@@ -434,6 +463,31 @@ class BrowserService:
         if current.get('invalid') or clean_name(current.get('name')) != name or parse_tracking_field(current['field']) != tracking_id:
             raise GuardError('待处理 Key 行身份发生变化，已停止。')
         return row, snapshot['columns'], current
+
+    def _read_keys(self, account_id='', known_keys=()):
+        """Bind a fresh complete Key list without collecting or approving spend.
+
+        This permits a manual target check when costs are unavailable. The
+        separate management preparation still rechecks the account, complete
+        HTTP target and surviving control Key before any deletion permit.
+        """
+        self.anchor = None
+        self.known_keys = set()
+        self._last_key_snapshot = None
+        args = identity_read_args({'account_id': account_id, 'known_keys': known_keys})
+        self._check_login_ready()
+        keys = self._keys()
+        if not keys:
+            raise GuardError('平台没有可绑定的 Key；无法确认当前账户。')
+        identity = check_identity(keys, **args)
+        reader = getattr(self, '_cost_reader', None)
+        if reader is not None and getattr(self, '_cost_reader_identity', None) != identity:
+            reader.clear()
+            self._cost_reader = None
+            self._cost_reader_identity = None
+        self.anchor = key_fingerprint(keys)
+        self.known_keys = {key['tracking_id'] for key in keys}
+        return {'keys': keys, 'account_id': identity}
 
     def _collect(self, start_date, account_id='', known_keys=()):
         self._check_login_ready()

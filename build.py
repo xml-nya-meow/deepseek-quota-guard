@@ -59,10 +59,19 @@ def browser_components(runtime: Path) -> tuple[list[Path], dict[str, str]]:
         folders.append(folder)
         revisions[name] = revision
 
-    # Ask the installed driver for its executable without launching a browser.
-    from playwright.sync_api import sync_playwright
-    with sync_playwright() as playwright_api:
-        executable = Path(playwright_api.chromium.executable_path).resolve()
+    # Resolve through the installed JS API without starting Python's async loop.
+    # On Windows that loop needs a local TCP socketpair even for metadata reads.
+    try:
+        resolved = subprocess.run([
+            str(package.parent / "node.exe"), "-e",
+            "process.stdout.write(require(process.argv[1]).chromium.executablePath())",
+            str(package),
+        ], check=True, capture_output=True, text=True, encoding="utf-8", timeout=20)
+        if not resolved.stdout.strip():
+            raise RuntimeError("The installed driver returned no Chromium executable path.")
+        executable = Path(resolved.stdout.strip()).resolve()
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("The installed driver could not resolve its Chromium executable path.") from exc
     if not executable.is_relative_to(folders[0].resolve()) or not executable.is_file():
         raise RuntimeError("Chromium executable does not match the installed Playwright version.")
     return folders, revisions
@@ -127,7 +136,7 @@ def copy_notices(output: Path, versions: dict[str, str]) -> dict[str, str]:
 
 
 def validate_bundle(output: Path) -> None:
-    forbidden_names = {"管理设置.json", "当前账本.json", "账本", "人员额度.xlsx", "状态.db", ".运行锁",
+    forbidden_names = {"管理设置.json", "当前账本.json", "界面偏好.json", "外观偏好.json", "账本", "人员额度.xlsx", "状态.db", ".运行锁",
                        ".初始化中", "browser-smoke.json"}
     forbidden_prefixes = ("运行日志-", "运行摘要-", "状态.db-")
     for item in output.rglob("*"):

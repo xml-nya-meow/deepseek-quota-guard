@@ -65,7 +65,7 @@ def _cell_value(row, index):
     return row[index].value if index < len(row) else None
 
 
-def _read_rows(sheet, cached_sheet, columns) -> list[Person]:
+def _read_rows(sheet, cached_sheet, columns, *, allow_unassigned=False) -> list[Person]:
     cached_sheet.reset_dimensions()
     people, name_rows = [], {}
     scanned_cells = 0
@@ -94,7 +94,7 @@ def _read_rows(sheet, cached_sheet, columns) -> list[Person]:
                         amount_value = cached.value
                 name = clean_name(name_value)
                 amount = money(amount_value, allow_skip=True)
-                if not name and amount != -1:
+                if not name and amount != -1 and not allow_unassigned:
                     raise GuardError("金额为 0 或正数时必须填写 API 名称。")
                 if name and name in name_rows:
                     raise GuardError(f"API 名称与第 {name_rows[name]} 行重复，请合并或更正。")
@@ -106,15 +106,19 @@ def _read_rows(sheet, cached_sheet, columns) -> list[Person]:
     return people
 
 
-def read_people_workbook(path: str | Path) -> list[Person]:
+def read_people_workbook(path: str | Path, *, allow_unassigned=False) -> list[Person]:
     """Read the uniquely headed quota sheet without changing the input file.
 
     Names, column order, styles and numeric display formats do not matter. Blank
     rows and extra columns with formatting only are ignored. Formulas are never
     executed; only saved numeric caches may supply amounts. Missing results are
     errors, never zero. The caller separately enforces its configured person count.
+    External imports remain strict by default. The internal canonical table may
+    explicitly allow unassigned rows whose validated amounts persist as defaults.
     """
     try:
+        if type(allow_unassigned) is not bool:
+            raise GuardError("待填写行选项必须是明确的开关。")
         source = Path(path)
         if source.suffix.lower() != ".xlsx":
             raise GuardError("请选择 .xlsx 文件。旧版 .xls 请先用 Excel/WPS 另存为 .xlsx。")
@@ -125,7 +129,7 @@ def read_people_workbook(path: str | Path) -> list[Person]:
             sheet, columns = _select_sheet(workbook)
             cached = load_workbook(BytesIO(data), read_only=True, data_only=True, keep_links=False)
             stack.callback(cached.close)
-            return _read_rows(sheet, cached[sheet.title], columns)
+            return _read_rows(sheet, cached[sheet.title], columns, allow_unassigned=allow_unassigned)
     except GuardError:
         raise
     except PermissionError as exc:

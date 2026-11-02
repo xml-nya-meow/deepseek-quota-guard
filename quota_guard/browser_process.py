@@ -29,9 +29,10 @@ from .profile_recovery import (WindowsLifetime, job_name, ownership, plain_direc
                                witness_main, write_marker)
 
 
-_TIMEOUTS = {'login': 45, 'collect': 90, 'prepare_revoke': 45,
+_TIMEOUTS = {'login': 45, 'collect': 90, 'read_keys': 45, 'prepare_revoke': 45,
              'inspect_revoke': 90, 'verify_revoke': 45, 'revoke': 65, 'selftest': 30}
 _STAGES = {'login': '正在打开登录窗口', 'collect': '正在核对平台费用',
+           'read_keys': '正在只读核验账户与 Key 列表',
            'prepare_revoke': '正在定位待处理人员', 'verify_revoke': '正在核实平台状态',
            'inspect_revoke': '正在只读检查删除准备',
            'revoke': '正在核实并处理额度', 'selftest': '正在检查浏览器运行环境'}
@@ -172,6 +173,10 @@ def _bootstrap(connection, target):
 
 def _worker_failure(exc, action, permit):
     """Preserve definite pre-submission failure only before this worker's gate."""
+    if action == 'read_keys':
+        return {'ok': False,
+                'error_type': 'AccountMismatch' if isinstance(exc, AccountMismatch) and permit is None else 'GuardError',
+                'message': '只读 Key 核验未完成；请核实登录账户及已有绑定，本次未取得可用身份。'}
     if action == 'inspect_revoke' and permit is not None:
         return {'ok': False, 'error_type': 'GuardError',
                 'message': '只读预检的执行状态不符合约定，未采用本次结果。'}
@@ -206,6 +211,31 @@ def _inspection_result(value, expected):
     return {field: value[field] for field in fields}
 
 
+def _identity_read_result(value, expected):
+    """No fee evidence, write result or secret may cross this read-only route."""
+    from .browser_service import UUID_PATTERN, check_identity, identity_read_args
+    from .core import clean_name
+    args = identity_read_args(expected)
+    if (not isinstance(value, dict) or set(value) != {'keys', 'account_id'}
+            or not isinstance(value.get('keys'), list) or not 1 <= len(value['keys']) <= 200):
+        raise GuardError('只读 Key 核验结果不符合约定，未采用本次结果。')
+    keys = []
+    for key in value['keys']:
+        if (not isinstance(key, dict) or set(key) != {'name', 'tracking_id'}
+                or not isinstance(key.get('name'), str) or not key['name']
+                or clean_name(key['name']) != key['name']
+                or not isinstance(key.get('tracking_id'), str)
+                or not UUID_PATTERN.fullmatch(key['tracking_id'])):
+            raise GuardError('只读 Key 核验结果含无效身份，未采用本次结果。')
+        keys.append({'name': key['name'], 'tracking_id': key['tracking_id']})
+    if len({key['tracking_id'].lower() for key in keys}) != len(keys):
+        raise GuardError('只读 Key 核验结果含重复身份，未采用本次结果。')
+    identity = check_identity(keys, **args)
+    if value.get('account_id') != identity:
+        raise AccountMismatch('只读 Key 核验的账户标识不一致，未采用本次结果。')
+    return {'keys': keys, 'account_id': identity}
+
+
 def _browser_worker(connection):
     """IPC runs on this thread; all Playwright calls stay on its own worker."""
     from .browser_service import BrowserService
@@ -235,8 +265,17 @@ def _browser_worker(connection):
                     active_action = action
                     service._log('isolated_action_started', session=session, generation=gate.get('generation'),
                                  task_id=task, action=action, pid=os.getpid())
-                    kwargs = dict(message['kwargs'])
+                    kwargs = message['kwargs'] if action == 'read_keys' else dict(message['kwargs'])
                     permit, ready_sent = None, False
+                    if action == 'read_keys':
+                        from .browser_service import identity_read_args
+                        try:
+                            kwargs = identity_read_args(kwargs)
+                        except GuardError as exc:
+                            connection.send({'kind': 'result', 'session': session, 'task': task,
+                                             **_worker_failure(exc, action, None)})
+                            active_action = None
+                            continue
                     if action == 'revoke':
                         permit = DeletePermit()
                         kwargs['permit'] = permit
@@ -270,6 +309,8 @@ def _browser_worker(connection):
                 result = future.result()
                 if active_action == 'inspect_revoke':
                     result = _inspection_result(result, kwargs)
+                elif active_action == 'read_keys':
+                    result = _identity_read_result(result, kwargs)
                 message = {'ok': True, 'result': result}
             except Exception as exc:
                 message = _worker_failure(exc, active_action, permit)
@@ -400,6 +441,13 @@ class IsolatedBrowserService:
             if action not in _TIMEOUTS:
                 future.set_exception(GuardError('不支持的浏览器动作。'))
                 return future
+            if action == 'read_keys':
+                from .browser_service import identity_read_args
+                try:
+                    kwargs = identity_read_args(kwargs)
+                except GuardError as exc:
+                    future.set_exception(exc)
+                    return future
             permit = kwargs.pop('permit', None)
             if action == 'revoke' and not isinstance(permit, DeletePermit):
                 future.set_exception(GuardError('撤销缺少父进程许可，未执行操作。'))
@@ -858,7 +906,16 @@ class IsolatedBrowserService:
                     self._progress = {'stage': '等待操作', 'started_at': time.monotonic()}
                     if message.get('ok') is True:
                         result = message.get('result')
-                        if task.action == 'inspect_revoke':
+                        if task.action == 'read_keys':
+                            try:
+                                if (task.permit is not None or task.permit_ready is not False
+                                        or task.decision_sent is not False or task.decision_allowed is not False
+                                        or task.target_lock_names):
+                                    raise GuardError('只读 Key 核验的执行状态不符合约定，未采用本次结果。')
+                                task.future.set_result(_identity_read_result(result, task.kwargs))
+                            except GuardError as exc:
+                                task.future.set_exception(exc)
+                        elif task.action == 'inspect_revoke':
                             try:
                                 if (task.permit is not None or task.permit_ready is not False
                                         or task.decision_sent is not False or task.decision_allowed is not False):
@@ -878,7 +935,13 @@ class IsolatedBrowserService:
                         else:
                             task.future.set_result(result)
                     else:
-                        if task.action == 'inspect_revoke':
+                        if task.action == 'read_keys':
+                            error_type = (AccountMismatch if message.get('error_type') == 'AccountMismatch'
+                                          and task.permit is None and task.permit_ready is False
+                                          and task.decision_sent is False and task.decision_allowed is False
+                                          else GuardError)
+                            error = error_type('只读 Key 核验未完成；请核实登录账户及已有绑定，本次未取得可用身份。')
+                        elif task.action == 'inspect_revoke':
                             # Never accept text from either a typed or untyped
                             # worker exception. This action has no write permit.
                             if (task.permit is not None or task.permit_ready is not False

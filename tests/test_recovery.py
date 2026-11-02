@@ -332,7 +332,7 @@ class RecoveryGuiTests(_LedgerFixture, unittest.TestCase):
             with self.subTest(button=key):
                 self.assertEqual(str(self.app.buttons[key].cget("state")), "normal")
         before = self.store.events()
-        with patch("quota_guard.ui.simpledialog.askstring") as ask, \
+        with patch("quota_guard.ui.ask_text") as ask, \
                 patch("quota_guard.ui.filedialog.askopenfilename") as choose:
             self.app.collect()
             self.app.start()

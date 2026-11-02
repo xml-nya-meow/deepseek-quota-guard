@@ -137,10 +137,11 @@ class DataStore:
                     self.DATABASE + "-shm", self.MARKER)) or any(
                        self.folder.glob("运行日志-*.jsonl")) or any(self.folder.glob("运行摘要-*.txt"))
 
-    def initialize(self, people_count: int, total_budget, start_date: str) -> Config:
+    def initialize(self, people_count: int, total_budget, start_date: str, *, initial_amount=-1) -> Config:
         if isinstance(people_count, bool) or not isinstance(people_count, int) or not 1 <= people_count <= 10000:
             raise GuardError("人数必须是 1 到 10000 的整数。")
         budget = money(total_budget)
+        default_amount = money(initial_amount, allow_skip=True)
         start = _date(start_date)
         if start > datetime.now(TZ).date().isoformat():
             raise GuardError("统计开始日期不能晚于今天。")
@@ -168,9 +169,10 @@ class DataStore:
                 for key, value in self._config_dict(config).items():
                     db.execute("INSERT INTO meta VALUES (?,?)", (key, str(value)))
                 self._event(db, "initialized", {"people_count": people_count,
-                    "total_budget": str(budget), "share": str(config.share), "start_date": start})
+                    "total_budget": str(budget), "share": str(config.share), "start_date": start,
+                    "initial_amount": str(default_amount)})
             self._write_json(self.config_path, self._config_dict(config))
-            self._write_workbook([Person("", Decimal(-1)) for _ in range(people_count)])
+            self._write_workbook([Person("", default_amount) for _ in range(people_count)])
             marker.unlink()
             self.export_logs()
         except (OSError, sqlite3.Error) as exc:
@@ -266,11 +268,13 @@ class DataStore:
         except OSError as exc:
             raise GuardError("无法读取表格，请先保存并关闭占用文件的软件。") from exc
 
-    def _validate_people(self, people: Iterable[Person], count: int) -> list[Person]:
+    def _validate_people(self, people: Iterable[Person], count: int, *, allow_unassigned=False) -> list[Person]:
+        if type(allow_unassigned) is not bool:
+            raise GuardError("待填写行选项必须是明确的开关。")
         rows, names = [], set()
         for person in people:
             name, amount = clean_name(person.name), money(person.amount, allow_skip=True)
-            if not name and amount != -1:
+            if not name and amount != -1 and not allow_unassigned:
                 raise GuardError("金额为 0 或正数时必须填写 API 名称。")
             if name in names:
                 raise GuardError(f"API 名称重复：{name}")
@@ -284,7 +288,10 @@ class DataStore:
     def read_people(self) -> list[Person]:
         from .excel_io import read_people_workbook
         config = self.load()
-        return self._validate_people(read_people_workbook(self.workbook_path), config.people_count)
+        # The app's canonical table persists defaults on unassigned rows. They
+        # are ignored by binding/evaluation until a valid name is supplied.
+        return self._validate_people(read_people_workbook(self.workbook_path, allow_unassigned=True),
+                                     config.people_count, allow_unassigned=True)
 
     def _write_workbook(self, people: list[Person]):
         wb = Workbook()
@@ -316,9 +323,9 @@ class DataStore:
             if os.path.exists(temp):
                 os.unlink(temp)
 
-    def save_people(self, people: list[Person], expected_hash: str | None = None):
+    def save_people(self, people: list[Person], expected_hash: str | None = None, *, allow_unassigned=False):
         config = self.load()
-        rows = self._validate_people(people, config.people_count)
+        rows = self._validate_people(people, config.people_count, allow_unassigned=allow_unassigned)
         if expected_hash is not None and expected_hash != self.workbook_hash():
             raise GuardError("表格已被其他软件修改，请重新读取后再保存。")
         try:
@@ -521,8 +528,22 @@ class DataStore:
             return self
         return self.create_successor(destination, start, keep_account=True)
 
+    def create_list(self, destination: Path, people_count: int, total_budget,
+                    start_date: str, *, inherit_people: bool = True, initial_amount=-1) -> DataStore:
+        """Create an independent list while retaining this account's obligations.
+
+        A blank roster is not a new account: existing identity, retirement and
+        uncertain operations must remain available for reconciliation.
+        """
+        if isinstance(people_count, bool) or not isinstance(people_count, int) or not 1 <= people_count <= 10000:
+            raise GuardError("人数必须是 1 到 10000 的整数。")
+        return self.create_successor(destination, _date(start_date), keep_account=True,
+            people_count=people_count, total_budget=money(total_budget), inherit_people=inherit_people,
+            initial_amount=initial_amount)
+
     def create_successor(self, destination: Path, start_date: str | None = None,
-                         *, keep_account: bool = False) -> DataStore:
+                         *, keep_account: bool = False, people_count: int | None = None,
+                         total_budget=None, inherit_people: bool = True, initial_amount=-1) -> DataStore:
         """Publish a complete new period without editing or moving the old one.
 
         The UI supplies a fresh destination and switches only after this returns.
@@ -530,6 +551,13 @@ class DataStore:
         costs or snapshots. Other-account successors have no inherited bindings.
         """
         config = self.load()
+        count = config.people_count if people_count is None else people_count
+        if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 10000:
+            raise GuardError("人数必须是 1 到 10000 的整数。")
+        budget = config.total_budget if total_budget is None else money(total_budget)
+        default_amount = money(initial_amount, allow_skip=True)
+        if type(inherit_people) is not bool:
+            raise GuardError("是否延续人员内容必须是明确的开关。")
         start = config.start_date if start_date is None else _date(start_date)
         if start > datetime.now(TZ).date().isoformat():
             raise GuardError("统计开始日期不能晚于今天。")
@@ -537,7 +565,14 @@ class DataStore:
         if target.exists():
             raise GuardError("新账本目录必须不存在，不能覆盖已有文件夹。")
         fingerprint = self.workbook_hash()
-        people = self.read_people()
+        original_people = self.read_people()
+        people = (self._validate_people(original_people, count, allow_unassigned=True) if inherit_people
+                  else [Person("", default_amount)] * count)
+        if inherit_people and people_count is not None:
+            # New-list defaults apply only to vacant positions. Retained names
+            # keep exact amounts, including explicitly skipped named people.
+            people = [person for person in people if person.name]
+            people.extend([Person("", default_amount)] * (count - len(people)))
         stage = None
         try:
             # Freeze the source's identity/actions while constructing its
@@ -574,7 +609,7 @@ class DataStore:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 stage = Path(tempfile.mkdtemp(prefix=".new-ledger-", dir=target.parent)).resolve()
                 successor = DataStore(stage)
-                successor.initialize(config.people_count, config.total_budget, start)
+                successor.initialize(count, budget, start, initial_amount=default_amount)
                 with successor._connect() as new_db:
                     new_db.execute("BEGIN IMMEDIATE")
                     if keep_account:
@@ -585,8 +620,9 @@ class DataStore:
                     self._event(new_db, "successor_created", {"previous_period_id": config.period_id,
                         "previous_folder": str(self.folder), "previous_start_date": config.start_date,
                         "start_date": start, "keep_account": keep_account,
+                        "inherit_people": inherit_people, "initial_amount": str(default_amount),
                         "inherited_binding_count": len(bindings), "inherited_action_count": len(actions)})
-                successor.save_people(people)
+                successor.save_people(people, allow_unassigned=True)
                 successor.load()
                 if self.workbook_hash() != fingerprint or self.load() != config:
                     raise GuardError("创建期间原账本或人员表发生变化，新账本未启用，请重试。")
@@ -613,7 +649,7 @@ class DataStore:
         account = _identifier(account_id)
         if config.account_id and account != config.account_id:
             raise AccountMismatch("登录账户与此数据目录不一致；请登录原账户，或保留原账本并建立新账本。")
-        people = [p for p in self.read_people() if p.amount >= 0]
+        people = [p for p in self.read_people() if p.name and p.amount >= 0]
         by_name: dict[str, list[str]] = {}
         seen_ids = set()
         for key in keys:
@@ -650,6 +686,60 @@ class DataStore:
             if additions or not config.account_id:
                 self._event(db, "keys_bound", {"bindings": [{"name": n, "tracking_id": k} for k, n in additions]})
         self.evaluate()
+
+    def bind_forced_target(self, keys: list[dict], account_id: str, name: str, tracking_id: str):
+        """Bind only the explicitly selected roster target, regardless of quota.
+
+        The full platform list is still checked for identity ambiguity. Missing
+        unrelated roster names do not prevent an otherwise exact manual target.
+        This does not change the automatic binding rule that skips amount -1.
+        """
+        config = self.load()
+        account, selected_id = _identifier(account_id), _identifier(tracking_id)
+        selected_name = clean_name(name)
+        if config.account_id and account != config.account_id:
+            raise AccountMismatch("登录账户与此数据目录不一致；请登录原账户，或保留原账本并建立新账本。")
+        fingerprint = self.workbook_hash()
+        people = self.read_people()
+        if not selected_name or sum(person.name == selected_name for person in people) != 1:
+            raise GuardError("强制删除目标必须是当前人员表中的一个明确人员。")
+        if not isinstance(keys, list) or not keys:
+            raise GuardError("平台完整 Key 列表为空或无效，无法安全绑定。")
+        by_name: dict[str, list[str]] = {}
+        seen_ids = set()
+        for key in keys:
+            if not isinstance(key, dict) or "name" not in key or "tracking_id" not in key:
+                raise GuardError("平台 Key 列表缺少姓名或 Tracking ID，无法安全绑定。")
+            platform_name, key_id = clean_name(key["name"]), _identifier(key["tracking_id"])
+            if not platform_name or key_id in seen_ids:
+                raise GuardError("平台完整 Key 列表存在空名或重复 Tracking ID，无法安全绑定。")
+            seen_ids.add(key_id)
+            by_name.setdefault(platform_name, []).append(key_id)
+        if by_name.get(selected_name) != [selected_id]:
+            raise GuardError("选中人员与平台唯一同名 Key 的 Tracking ID 不一致，请重新核对。")
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if self.load() != config or self.workbook_hash() != fingerprint:
+                raise GuardError("核对期间账本或人员表发生变化，请重新选择目标。")
+            bindings = list(db.execute("SELECT tracking_id,person,active FROM bindings"))
+            historical = [(key, active) for key, person, active in bindings if person == selected_name]
+            active_ids = [key for key, active in historical if active]
+            if historical and not active_ids:
+                raise GuardError(f"{selected_name} 已有退休 Key 的历史，必须人工核对换绑，不能按同名 Key 覆盖历史。")
+            if active_ids and active_ids != [selected_id]:
+                raise GuardError(f"{selected_name} 的 Tracking ID 已变更，必须人工核对历史并换绑。")
+            existing = next(((person, active) for key, person, active in bindings if key == selected_id), None)
+            if existing is not None and (existing[0] != selected_name or not existing[1]):
+                raise GuardError("选中 Key 已绑定其他人员或已退休，拒绝覆盖既有身份。")
+            additions = []
+            if existing is None:
+                db.execute("INSERT INTO bindings(tracking_id,person) VALUES (?,?)", (selected_id, selected_name))
+                additions.append({"name": selected_name, "tracking_id": selected_id})
+            if not config.account_id:
+                db.execute("UPDATE meta SET value=? WHERE key='account_id'", (account,))
+            if additions or not config.account_id:
+                self._event(db, "keys_bound", {"bindings": additions, "source": "manual_force"})
+        self.export_logs()
 
     def apply_snapshot(self, totals: dict[str, Decimal], source_id: str,
                        start_date: str, end_date: str) -> list[dict]:
@@ -738,8 +828,8 @@ class DataStore:
         latest_source = latest[0] if latest else None
         results = []
         for person in people:
-            ids = [key for key, name, _ in bindings if name == person.name]
-            active_ids = [key for key, name, active in bindings if name == person.name and active]
+            ids = [key for key, name, _ in bindings if person.name and name == person.name]
+            active_ids = [key for key, name, active in bindings if person.name and name == person.name and active]
             with localcontext() as context:
                 context.prec = 50
                 known = [costs[k][0] for k in ids if k in costs]
@@ -750,7 +840,10 @@ class DataStore:
                       "share": config.share, "tracking_id": active_ids[0] if len(active_ids) == 1 else "",
                       "status": "ok", "reasons": [], "complete": complete,
                       "spent_is_lower_bound": spent is not None and not complete}
-            if person.amount == -1:
+            if not person.name:
+                result["status"] = "unassigned"
+                result["reasons"].append("尚未填写 API 名称，不参与管理")
+            elif person.amount == -1:
                 result["status"] = "skipped"
             elif ids and not active_ids:
                 result["status"] = "retired"
@@ -841,7 +934,8 @@ class DataStore:
 
     def record_action(self, name: str, tracking_id: str, status: str, detail: str, *,
                       operation_id: str | None = None, evidence: dict | None = None,
-                      continuation: bool = False, read_only: bool = False):
+                      continuation: bool = False, read_only: bool = False,
+                      intent: str | None = None):
         # Only the outcome of an existing operation can bypass the workbook.
         # New intents/approval and new evidence always require a valid table.
         self.load(require_workbook=not continuation)
@@ -858,6 +952,9 @@ class DataStore:
         if type(read_only) is not bool or (read_only and
                 (status != 'pending' or continuation or evidence is not None or operation_id is None)):
             raise GuardError("只读标记仅用于无撤销证据的新核实起点。")
+        if intent is not None and (intent != 'manual_force' or status not in {'pending', 'requested'}
+                or continuation or read_only or operation_id is None):
+            raise GuardError("强制删除意图仅用于有编号的新撤销操作起点，不能追加到恢复或只读记录。")
         if status == 'not_submitted' and (not continuation or operation_id is None):
             raise GuardError("未提交结论只允许延续有编号的新准备操作。")
         if status == 'observation_failed' and not continuation:
@@ -880,6 +977,17 @@ class DataStore:
                 raise GuardError("操作目标与既有绑定不一致，拒绝记录成功。")
             history = self._action_history(db)
             operation = self._operation_history(history, payload)
+            if intent is not None:
+                if operation:
+                    raise GuardError("已有操作不能追加或改写为强制删除意图。")
+                payload['intent'] = intent
+            elif operation:
+                original_intent = operation[0].get('intent')
+                if original_intent not in {None, 'manual_force'} or any(
+                        event.get('intent') != original_intent for event in operation):
+                    raise GuardError("原操作的删除意图不一致，不能继续记录。")
+                if original_intent is not None:
+                    payload['intent'] = original_intent
             if read_only and operation:
                 raise GuardError("不能把已有操作重新标记为只读核实。")
             if status == 'pending':
