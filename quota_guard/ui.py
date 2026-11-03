@@ -547,9 +547,10 @@ class App:
         targets.update(self.store.active_tracking_ids(require_workbook=False))
         targets.update(action['tracking_id'] for action in self.store.unresolved_actions())
         if self.target_lock is None:
-            self.target_lock = TargetLock(targets)
-        else:
-            self.target_lock.update(self.target_lock.tracking_ids | targets)
+            # Retain the cleanup owner before the first resource acquisition:
+            # even a failed initial batch plus failed rollback can be closed.
+            self.target_lock = TargetLock()
+        self.target_lock.update(self.target_lock.tracking_ids | targets)
 
     def _target_is_claimed(self, tracking_id):
         return self.target_lock is not None and self.target_lock.covers({tracking_id})

@@ -206,6 +206,9 @@ _HEADER_ENUMS = {
 }
 _HEADER_COUNTER_LIMITS = {'value_length': 1025, 'matched_request_count': 10000}
 _HEADER_BOOLEANS = frozenset({'bearer_format_passed'})
+_KEY_ENUMS = {
+    'key_field': frozenset({'name', 'tracking_id', 'sensitive_id', 'created_at'}),
+}
 _COST_ENUMS = {
     'scope_kind': frozenset({'managed_keys'}),
     'fee_id_source': frozenset({'api_key.tracking_id'}),
@@ -279,7 +282,13 @@ def safe_fields(fields):
     result = {}
     for key, value in fields.items():
         key = str(key)
-        if key in _COST_ENUMS:
+        if key in _KEY_ENUMS:
+            if type(value) is str and value in _KEY_ENUMS[key]:
+                result[key] = value
+        elif key == 'field_present':
+            if type(value) is bool:
+                result[key] = value
+        elif key in _COST_ENUMS:
             if type(value) is str and value in _COST_ENUMS[key]:
                 result[key] = value
         elif key in _COST_COUNTER_LIMITS:

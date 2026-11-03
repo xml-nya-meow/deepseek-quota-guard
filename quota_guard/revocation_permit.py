@@ -17,9 +17,31 @@ from .core import GuardError
 MAX_GRANT_SECONDS = 5.0
 _CLOCK_FIELDS = ('issued_monotonic', 'expires_monotonic', 'issued_wall', 'expires_wall')
 
+KEY_READ_REASONS = {
+    'KEY_HTTP_AUTH_REQUIRED': 'Key HTTP 请求授权失效或被拒绝，请重新核验登录。',
+    'KEY_HTTP_REDIRECTED': 'Key HTTP 请求被重定向或返回地址不符。',
+    'KEY_HTTP_FAILED': 'Key HTTP 请求未返回成功状态，请核验网络与平台状态。',
+    'KEY_RESPONSE_TYPE_INVALID': 'Key HTTP 响应不是预期 JSON 类型。',
+    'KEY_RESPONSE_SIZE_INVALID': 'Key HTTP 响应大小或长度声明不符合读取限制。',
+    'KEY_RESPONSE_JSON_INVALID': 'Key HTTP 响应 JSON 无效、含重复字段或非有限数值。',
+    'KEY_RESPONSE_STATUS_INVALID': 'Key HTTP 响应状态码字段未通过校验。',
+    'KEY_RESPONSE_BUSINESS_INVALID': 'Key HTTP 响应业务状态或数据结构未通过校验。',
+    'KEY_LIST_SCHEMA_INVALID': 'Key HTTP 响应未包含符合限制的完整列表。',
+    'KEY_NAME_INVALID': 'Key HTTP 列表中的名称字段缺失或格式不符。',
+    'KEY_TRACKING_ID_INVALID': 'Key HTTP 列表中的 Tracking ID 缺失或不完整。',
+    'KEY_REDACTED_ID_INVALID': 'Key HTTP 列表中的脱敏标识字段 sensitive_id 不符合已观察结构。',
+    'KEY_CREATED_AT_INVALID': 'Key HTTP 列表中的创建时间 created_at 不符合已观察的整数秒结构。',
+    'KEY_LIST_DUPLICATE_IDENTITY': 'Key HTTP 完整列表存在重复身份。',
+    'KEY_EXPECTED_LIST_INVALID': '本地已核验列表或选中目标无效。',
+    'KEY_LIST_IDENTITY_MISMATCH': 'HTTP 与网页核验得到的完整 Key 身份列表不一致，请重新读取。',
+    'KEY_TARGET_ALREADY_ATTEMPTED': '此会话已尝试提交该目标，禁止重复提交，请先核实结果。',
+    'KEY_LIST_TRANSPORT_FAILED': '读取 Key HTTP 列表时发生连接、超时或读取异常。',
+}
+
 # Only these application-owned labels cross the worker boundary. Never forward
 # an SDK error, request header, URL or server message as preparation diagnostics.
 PREPARATION_REASONS = {
+    **KEY_READ_REASONS,
     'PREPARATION_FAILED': '',
     'KEY_SESSION_UNAVAILABLE': '独立浏览器会话尚未就绪，请重新登录。',
     'KEY_SESSION_MISMATCH': '管理授权不属于当前独立浏览器会话。',

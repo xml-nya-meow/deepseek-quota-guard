@@ -17,6 +17,7 @@ from .core import GuardError
 
 _PREFIX = "Global\\DeepSeekQuotaGuard.VerifiedTarget.v1."
 _EXISTS = 183
+_NO_INITIAL_TARGETS = object()
 
 
 class TargetLockError(GuardError):
@@ -26,6 +27,23 @@ class TargetLockError(GuardError):
     def __init__(self):
         super().__init__('同一平台目标正由本机另一个管理器或其退出清理进程占用；'
                          '请正常关闭旧版本或其他管理器，等待清理完成后重新读取费用。')
+
+
+class TargetLockCleanupError(GuardError):
+    """Keep the cleanup owner reachable for legacy single-step construction.
+
+    GUI code uses two-phase acquisition instead. This local object must never
+    cross IPC; close it on its creating thread after browser cleanup settles.
+    """
+    def __init__(self, cleanup_owner):
+        self.cleanup_owner = cleanup_owner
+        super().__init__('目标互斥清理未完成，请保持停止并关闭窗口重试清理。')
+
+
+class _AcquireCleanupError(GuardError):
+    def __init__(self, handle):
+        self.handle = handle
+        super().__init__('无法关闭冲突目标的互斥句柄，请退出本程序后重试。')
 
 
 def _targets(values):
@@ -97,8 +115,14 @@ class _WindowsMutexBackend:
         if not handle:
             raise GuardError("无法取得目标互斥；可能已有其他实例占用或系统拒绝访问。")
         if error == _EXISTS:
-            if not self.api.CloseHandle(handle):
-                raise GuardError("无法关闭冲突目标的互斥句柄，请退出本程序后重试。")
+            # This reference never owns the competing mutex. If closing fails,
+            # transfer it to TargetLock's rollback/close path, not the GC.
+            try:
+                closed = self.api.CloseHandle(handle)
+            except Exception:
+                closed = False
+            if not closed:
+                raise _AcquireCleanupError(_Handle(handle, owned=False)) from None
             raise TargetLockError()
         return _Handle(handle)
 
@@ -134,8 +158,8 @@ class TargetLock:
     disables coverage checks and further updates; ``close`` may still be retried.
     No destructor releases mutexes from an arbitrary garbage-collector thread.
     """
-    def __init__(self, tracking_ids):
-        targets = _targets(tracking_ids)
+    def __init__(self, tracking_ids=_NO_INITIAL_TARGETS):
+        targets = None if tracking_ids is _NO_INITIAL_TARGETS else _targets(tracking_ids)
         self._owner = threading.current_thread()
         self._handles = {}
         self._closed = False
@@ -146,7 +170,15 @@ class TargetLock:
             raise
         except Exception:
             raise GuardError("无法建立 Windows 目标互斥，已停止管理。") from None
-        self.update(targets)
+        if targets is not None:
+            try:
+                self.update(targets)
+            except BaseException:
+                if self._handles:
+                    # Older callers can explicitly retry cleanup through the
+                    # exception. New callers must hold self before update().
+                    raise TargetLockCleanupError(self) from None
+                raise
 
     def _check_thread(self):
         if threading.current_thread() is not self._owner:
@@ -191,6 +223,8 @@ class TargetLock:
             for target in sorted(targets.difference(self._handles)):
                 additions[target] = self._backend.acquire(_name(target))
         except BaseException as exc:
+            if isinstance(exc, _AcquireCleanupError):
+                additions[target] = exc.handle
             if not self._release(additions, tuple(additions)):
                 self._handles.update(additions)
                 self._broken = True

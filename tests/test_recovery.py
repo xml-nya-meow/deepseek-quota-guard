@@ -229,7 +229,7 @@ class _OfflineBrowser:
 
 class _OfflineTargetLock:
     """The kernel exclusion contract has its own tests; record UI coverage here."""
-    def __init__(self, targets):
+    def __init__(self, targets=()):
         self.tracking_ids = frozenset(targets)
         self.closed = False
 

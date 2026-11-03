@@ -16,6 +16,7 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from .core import GuardError
 from .page_notices import dismiss_optional_notice
 from .platform_http import is_cost_endpoint
+from .revocation_permit import KEY_READ_REASONS
 
 
 BASE = 'https://platform.deepseek.com'
@@ -63,6 +64,13 @@ class KeyPreparationError(GuardError):
         super().__init__(_PREPARATION_MESSAGES[self.reason_code])
 
 
+class KeyReadError(GuardError):
+    """Closed diagnostic vocabulary; no response values or SDK messages."""
+    def __init__(self, reason_code):
+        self.reason_code = reason_code if reason_code in KEY_READ_REASONS else 'KEY_LIST_TRANSPORT_FAILED'
+        super().__init__(KEY_READ_REASONS[self.reason_code])
+
+
 @dataclass(frozen=True, repr=False)
 class DeleteTarget:
     tracking_id: str
@@ -77,10 +85,11 @@ def _valid_name(value):
 
 
 def _identity(value):
-    if (not isinstance(value, dict) or not _valid_name(value.get('name'))
-            or not isinstance(value.get('tracking_id'), str)
+    if not isinstance(value, dict) or not _valid_name(value.get('name')):
+        raise KeyReadError('KEY_NAME_INVALID')
+    if (not isinstance(value.get('tracking_id'), str)
             or not _TRACKING.fullmatch(value['tracking_id'])):
-        raise GuardError('平台 Key 身份字段无效，未确认操作目标。')
+        raise KeyReadError('KEY_TRACKING_ID_INVALID')
     return value['name'], value['tracking_id']
 
 
@@ -88,9 +97,10 @@ def _target(value):
     name, tracking_id = _identity(value)
     sensitive_id, created_at = value.get('sensitive_id'), value.get('created_at')
     if (not isinstance(sensitive_id, str) or len(sensitive_id) > 160
-            or not _REDACTED.fullmatch(sensitive_id)
-            or type(created_at) is not int or not 0 < created_at <= 253402300799):
-        raise GuardError('平台 Key 目标字段不符合已观察结构，未确认操作目标。')
+            or not _REDACTED.fullmatch(sensitive_id)):
+        raise KeyReadError('KEY_REDACTED_ID_INVALID')
+    if type(created_at) is not int or not 0 < created_at <= 253402300799:
+        raise KeyReadError('KEY_CREATED_AT_INVALID')
     return DeleteTarget(tracking_id, name, sensitive_id, created_at)
 
 
@@ -385,26 +395,31 @@ class ConsoleKeyManager:
             if response.status in (401, 403) or 300 <= response.status < 400 or response.url != url:
                 self._headers.clear()
                 self._issued = None
-            raise GuardError('平台 Key 接口未返回可确认的正常结果，请核实平台状态。')
+            if response.status in (401, 403):
+                raise KeyReadError('KEY_HTTP_AUTH_REQUIRED')
+            if 300 <= response.status < 400 or response.url != url:
+                raise KeyReadError('KEY_HTTP_REDIRECTED')
+            raise KeyReadError('KEY_HTTP_FAILED')
         length = response.headers.get('content-length')
         media_type = response.headers.get('content-type', '').partition(';')[0].strip().lower()
-        if (media_type != 'application/json' or
-                length is not None and (not length.isdigit() or int(length) > MAX_BODY_BYTES)):
-            raise GuardError('平台 Key 响应类型或大小不符合读取限制，请核实平台状态。')
+        if media_type != 'application/json':
+            raise KeyReadError('KEY_RESPONSE_TYPE_INVALID')
+        if length is not None and (not length.isdigit() or int(length) > MAX_BODY_BYTES):
+            raise KeyReadError('KEY_RESPONSE_SIZE_INVALID')
         body = response.body()
         if len(body) > MAX_BODY_BYTES:
-            raise GuardError('平台 Key 响应超过读取限制，请核实平台状态。')
+            raise KeyReadError('KEY_RESPONSE_SIZE_INVALID')
         try:
             payload = json.loads(body, object_pairs_hook=_strict_object, parse_constant=_reject_constant)
         except (ValueError, UnicodeError, RecursionError):
-            raise GuardError('平台 Key 响应不是有效 JSON，请核实平台状态。') from None
+            raise KeyReadError('KEY_RESPONSE_JSON_INVALID') from None
         if not isinstance(payload, dict) or type(payload.get('code')) is not int or payload['code'] != 0:
-            raise GuardError('平台 Key 响应未通过状态校验，请核实平台状态。')
+            raise KeyReadError('KEY_RESPONSE_STATUS_INVALID')
         data = payload.get('data')
         if (not isinstance(data, dict) or type(data.get('biz_code')) is not int
                 or data['biz_code'] != 0 or 'biz_data' not in data
                 or data['biz_data'] is not None and not isinstance(data['biz_data'], dict)):
-            raise GuardError('平台 Key 响应未通过业务校验，请核实平台状态。')
+            raise KeyReadError('KEY_RESPONSE_BUSINESS_INVALID')
         return data['biz_data']
 
     @staticmethod
@@ -417,21 +432,43 @@ class ConsoleKeyManager:
 
     def _read_targets(self):
         options, response = self._options(), None
+        row_index = None
         try:
             response = self._context.request.get(LIST_URL, **options)
             data = self._payload(response, LIST_URL)
             rows = data.get('api_keys') if isinstance(data, dict) else None
             if not isinstance(rows, list) or len(rows) > 1000:
-                raise GuardError('平台未返回完整 Key 列表，未确认操作目标。')
-            targets = [_target(row) for row in rows]
-            if (len({item.tracking_id for item in targets}) != len(targets)
+                raise KeyReadError('KEY_LIST_SCHEMA_INVALID')
+            targets = []
+            for row_index, row in enumerate(rows):
+                targets.append(_target(row))
+            row_index = None
+            if (len({item.tracking_id.lower() for item in targets}) != len(targets)
                     or len({item.sensitive_id for item in targets}) != len(targets)):
-                raise GuardError('平台 Key 完整列表中存在重复身份，未确认操作目标。')
+                raise KeyReadError('KEY_LIST_DUPLICATE_IDENTITY')
             return targets
+        except KeyReadError as exc:
+            metadata = {}
+            field_name = {'KEY_NAME_INVALID': 'name', 'KEY_TRACKING_ID_INVALID': 'tracking_id',
+                          'KEY_REDACTED_ID_INVALID': 'sensitive_id',
+                          'KEY_CREATED_AT_INVALID': 'created_at'}.get(exc.reason_code)
+            if row_index is not None and field_name:
+                present = isinstance(row, dict) and field_name in row
+                value = row.get(field_name) if isinstance(row, dict) else row
+                kind = type(value).__name__
+                metadata = {'key_field': field_name, 'field_present': present,
+                            'value_type': ('none' if value is None else kind
+                                           if kind in {'str', 'bool', 'int', 'float', 'list', 'dict'} else 'other')}
+                if isinstance(value, str):
+                    metadata['value_length'] = min(len(value), 1025)
+            self._report('key_http_read_rejected', reason_code=exc.reason_code,
+                         count=row_index + 1 if row_index is not None else 0, **metadata)
+            raise
         except GuardError:
             raise
         except Exception:
-            raise GuardError('读取平台 Key 列表失败，未能核实当前状态。') from None
+            self._report('key_http_read_rejected', reason_code='KEY_LIST_TRANSPORT_FAILED')
+            raise KeyReadError('KEY_LIST_TRANSPORT_FAILED') from None
         finally:
             self._dispose(response)
 
@@ -448,14 +485,17 @@ class ConsoleKeyManager:
         self._issued = None
         requested = _identity({'name': name, 'tracking_id': tracking_id})
         if not isinstance(expected_keys, (list, tuple)) or not expected_keys:
-            raise GuardError('缺少已经核验的完整 Key 列表，未确认操作目标。')
+            raise KeyReadError('KEY_EXPECTED_LIST_INVALID')
         expected = [_identity(item) for item in expected_keys]
-        if (len({item[1] for item in expected}) != len(expected) or requested not in expected
-                or tracking_id in self._attempted):
-            raise GuardError('已核验 Key 列表无效或目标已尝试提交，禁止重复操作。')
+        if len({item[1].lower() for item in expected}) != len(expected) or requested not in expected:
+            raise KeyReadError('KEY_EXPECTED_LIST_INVALID')
+        if tracking_id in self._attempted:
+            raise KeyReadError('KEY_TARGET_ALREADY_ATTEMPTED')
         targets = self._read_targets()
         if {(item.name, item.tracking_id) for item in targets} != set(expected):
-            raise GuardError('HTTP 与已核验的完整 Key 列表不一致，未确认操作目标。')
+            self._report('key_http_read_rejected', reason_code='KEY_LIST_IDENTITY_MISMATCH',
+                         key_count=len(targets), count=len(expected))
+            raise KeyReadError('KEY_LIST_IDENTITY_MISMATCH')
         selected = next(item for item in targets if (item.name, item.tracking_id) == requested)
         self._report('key_http_target_verified', key_count=len(targets))
         self._issued = selected
