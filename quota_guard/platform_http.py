@@ -1,10 +1,11 @@
 """Read-only console HTTP adapter for the application's own login session.
 
 These are observed console endpoints, not DeepSeek's public model API contract.
-The adapter only sends GET requests to one fixed endpoint. It never reads a
-browser profile, cookies, local storage, or a model API key. A bearer header is
-observed only on the app's own browser's request to that same endpoint, retained
-in worker memory, and discarded when the session is replaced.
+The adapter only sends GET requests to the fixed cost endpoint. It never reads
+a browser profile, cookies, local storage, or a model API key. Scoped reads
+observe the bearer on the exact Key-list GET of the app's own isolated console
+page; legacy callers observe the cost GET. The bearer stays in worker memory
+and is discarded when the session is replaced.
 """
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -18,6 +19,7 @@ from .core import GuardError
 
 BASE = 'https://platform.deepseek.com'
 COST_PATH = '/api/v0/usage/by_api_key/cost'
+KEY_LIST_URL = BASE + '/api/v0/users/get_api_keys'
 TZ = timezone(timedelta(hours=8))
 MAX_BODY_BYTES = 10_000_000
 HTTP_TIMEOUT_MS = 20_000
@@ -41,7 +43,18 @@ def is_cost_endpoint(url):
         return False
 
 
-def cost_url(start_date, end_date):
+def normalize_cost_scope(tracking_ids):
+    """An explicit empty scope must never turn into an account-wide query."""
+    if (not isinstance(tracking_ids, (list, tuple, set, frozenset))
+            or not 0 < len(tracking_ids) <= 200
+            or any(not isinstance(key, str) or not re.fullmatch(r'[A-Za-z0-9_-]{8,200}', key)
+                   or key.lower().startswith('sk-') for key in tracking_ids)
+            or len(set(tracking_ids)) != len(tracking_ids)):
+        raise CostReadError('费用查询需要明确且唯一的受管 Key 范围。', reason_code='INVALID_KEY_SCOPE')
+    return tuple(sorted(tracking_ids))
+
+
+def cost_url(start_date, end_date, *, tracking_ids=None):
     """UI dates are inclusive; the observed HTTP interval is [start, end)."""
     try:
         first, last = date.fromisoformat(start_date), date.fromisoformat(end_date)
@@ -52,19 +65,40 @@ def cost_url(start_date, end_date):
     except (TypeError, ValueError, OverflowError):
         raise CostReadError('统计日期范围无效，请修改统计起点。',
                             reason_code='INVALID_DATE_RANGE') from None
-    return BASE + COST_PATH + '?' + urlencode({'start': begin, 'end': finish, 'tz': 28800})
+    query = {'start': begin, 'end': finish, 'tz': 28800}
+    if tracking_ids is not None:
+        # Official client serializes array values as repeated query parameters.
+        query['api_key_tracking_id'] = normalize_cost_scope(tracking_ids)
+    return BASE + COST_PATH + '?' + urlencode(query, doseq=True)
+
+
+def _message_metadata(mapping, names, prefix):
+    """Describe only known message slots; never stringify server-controlled data."""
+    values = [mapping[name] for name in names if name in mapping]
+    kinds = {('null' if value is None else
+              type(value).__name__ if type(value) in (str, bool, int, float, dict, list) else
+              'decimal' if isinstance(value, Decimal) else 'other') for value in values}
+    return {
+        prefix + '_message_present': bool(values),
+        prefix + '_message_type': ('missing' if not kinds else
+                                  next(iter(kinds)) if len(kinds) == 1 else 'mixed'),
+        prefix + '_message_length': min(1024, max(
+            (len(value) for value in values if type(value) is str), default=0)),
+    }
 
 
 def cost_metadata(payload):
-    """Only numeric structure/range metadata; never copy account or fee values."""
+    """Bounded structural metadata, never response text, identities or costs."""
     fields = {}
     if not isinstance(payload, dict):
         return fields
+    fields.update(_message_metadata(payload, ('msg', 'message'), 'response'))
     if type(payload.get('code')) is int:
         fields['response_code'] = payload['code']
     envelope = payload.get('data')
     if not isinstance(envelope, dict):
         return fields
+    fields.update(_message_metadata(envelope, ('biz_msg', 'msg', 'message'), 'business'))
     if type(envelope.get('biz_code')) is int:
         fields['biz_code'] = envelope['biz_code']
     data = envelope.get('biz_data')
@@ -73,22 +107,45 @@ def cost_metadata(payload):
     for source, destination in (('start', 'response_start'), ('end', 'response_end')):
         if type(data.get(source)) is int:
             fields[destination] = data[source]
+    interval = data.get('bucket')
+    if type(interval) is int and interval in (3600, 86400):
+        fields['bucket_kind'] = 'integer'
+        fields['bucket_seconds'] = interval
+    elif type(interval) is str and interval in ('1h', '1d'):
+        fields['bucket_kind'] = 'text'
+        fields['bucket_seconds'] = {'1h': 3600, '1d': 86400}[interval]
+    else:
+        fields['bucket_kind'] = 'missing' if 'bucket' not in data else 'unsupported'
     groups = data.get('data')
     if not isinstance(groups, list):
         return fields
-    fields.update(group_count=len(groups), series_count=0, bucket_count=0, function_series_count=0)
+    fields.update(group_count=len(groups), series_count=0, bucket_count=0,
+                  function_series_count=0, function_bucket_count=0)
+    boundaries = {'': [None, None], 'function_': [None, None]}
     for group in groups:
         if not isinstance(group, dict):
             continue
-        functions = group.get('function_series')
-        if isinstance(functions, list):
-            fields['function_series_count'] += len(functions)
-        series = group.get('series')
-        if isinstance(series, list):
-            fields['series_count'] += len(series)
+        for name, prefix in (('series', ''), ('function_series', 'function_')):
+            series = group.get(name)
+            if not isinstance(series, list):
+                continue
+            fields[prefix + 'series_count'] += len(series)
+            first_time, last_time = boundaries[prefix]
             for entry in series:
                 if isinstance(entry, dict) and isinstance(entry.get('buckets'), list):
-                    fields['bucket_count'] += len(entry['buckets'])
+                    fields[prefix + 'bucket_count'] += len(entry['buckets'])
+                    for bucket in entry['buckets']:
+                        stamp = bucket.get('time') if isinstance(bucket, dict) else None
+                        # Unix seconds up to 9999-12-31; malformed values stay
+                        # the parser's responsibility and never enter this log.
+                        if type(stamp) is int and 0 <= stamp <= 253402300799:
+                            first_time = stamp if first_time is None else min(first_time, stamp)
+                            last_time = stamp if last_time is None else max(last_time, stamp)
+            boundaries[prefix] = [first_time, last_time]
+    for prefix, (first_time, last_time) in boundaries.items():
+        if first_time is not None:
+            fields[prefix + 'bucket_first_time'] = first_time
+            fields[prefix + 'bucket_last_time'] = last_time
     return fields
 
 
@@ -106,6 +163,14 @@ class ConsoleCostReader:
         # An exact endpoint and method prevent forwarding unrelated credentials.
         if request.method != 'GET' or not is_cost_endpoint(request.url):
             return
+        self._observe_authorization(request)
+
+    def _observe_key_list(self, request):
+        # Same isolated console session; no model credential or profile reads.
+        if request.method == 'GET' and request.url == KEY_LIST_URL:
+            self._observe_authorization(request)
+
+    def _observe_authorization(self, request):
         try:
             value = request.header_value('authorization')
         except Exception:
@@ -116,22 +181,30 @@ class ConsoleCostReader:
             if not value[7:].lower().startswith('sk-'):
                 self._authorization = value
 
-    def prepare(self, page):
+    def prepare(self, page, *, tracking_ids=None):
+        scoped = tracking_ids is not None
+        if scoped:
+            normalize_cost_scope(tracking_ids)
         if self._authorization is not None:
             return
         # Only initial session bootstrap needs a page navigation. No calendar,
         # filters, UI date selection, or default response supplies ledger costs.
         deadline = time.monotonic() + BOOTSTRAP_TIMEOUT_MS / 1000
-        page.on('request', self._observe)
+        # A scoped collection bootstraps on the Key page, avoiding the usage
+        # page's automatic account-wide cost request. Legacy offline callers
+        # without a scope retain their original bootstrap path.
+        route = '/api_keys' if scoped else '/usage'
+        observe = self._observe_key_list if scoped else self._observe
+        page.on('request', observe)
         try:
-            page.goto(BASE + '/usage', wait_until='domcontentloaded', timeout=BOOTSTRAP_TIMEOUT_MS)
+            page.goto(BASE + route, wait_until='domcontentloaded', timeout=BOOTSTRAP_TIMEOUT_MS)
             parsed = urlsplit(page.url)
-            if parsed.scheme != 'https' or parsed.netloc != 'platform.deepseek.com' or parsed.path != '/usage':
-                raise CostReadError('平台登录已失效或离开用量页面，请重新登录。', reason_code='AUTH_REQUIRED')
+            if parsed.scheme != 'https' or parsed.netloc != 'platform.deepseek.com' or parsed.path != route:
+                raise CostReadError('平台登录已失效或离开预期页面，请重新登录。', reason_code='AUTH_REQUIRED')
             while self._authorization is None and time.monotonic() < deadline:
                 parsed = urlsplit(page.url)
-                if parsed.scheme != 'https' or parsed.netloc != 'platform.deepseek.com' or parsed.path != '/usage':
-                    raise CostReadError('平台登录已失效或离开用量页面，请重新登录。', reason_code='AUTH_REQUIRED')
+                if parsed.scheme != 'https' or parsed.netloc != 'platform.deepseek.com' or parsed.path != route:
+                    raise CostReadError('平台登录已失效或离开预期页面，请重新登录。', reason_code='AUTH_REQUIRED')
                 page.wait_for_timeout(100)
             if self._authorization is None:
                 raise CostReadError('未取得本次登录的费用接口授权，请重新登录后读取。不会改用日期菜单。',
@@ -144,12 +217,12 @@ class ConsoleCostReader:
             raise CostReadError('建立费用读取会话失败，请检查网络后重新读取。',
                                 reason_code='SESSION_UNAVAILABLE', retryable=True) from None
         finally:
-            page.remove_listener('request', self._observe)
+            page.remove_listener('request', observe)
 
-    def read(self, start_date, end_date):
+    def read(self, start_date, end_date, *, tracking_ids=None):
         if self._authorization is None:
             raise CostReadError('费用读取会话尚未授权，请先完成登录。', reason_code='AUTH_REQUIRED')
-        url = cost_url(start_date, end_date)
+        url = cost_url(start_date, end_date, tracking_ids=tracking_ids)
         response = None
         try:
             # BrowserContext.request shares only this app's isolated cookie jar.

@@ -21,8 +21,10 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from . import __version__
-from .core import AccountMismatch, DataStore, GuardError, Person, clean_name, money
+from .core import AccountMismatch, DataStore, GuardError, Person, SnapshotApplyError, clean_name, money
+from .build_identity import diagnostic_build_identity
 from .revocation_permit import RevocationNotSubmitted
+from .target_lock import TargetLockError
 from .workspace import new_ledger_path, save_current_ledger
 from .preferences import (DEFAULT_POLL_INTERVAL_SECONDS, load_poll_interval,
                           save_poll_interval, validate_poll_interval, TableDefaults,
@@ -37,11 +39,40 @@ TZ = timezone(timedelta(hours=8))
 POLL_MS = DEFAULT_POLL_INTERVAL_SECONDS * 1000
 COLLECTION_MAX_AGE_SECONDS = 300
 FEE_STATE_LABELS = {
-    "NO_USAGE_DATA": "该周期暂无明细", "AUTH_REQUIRED": "需重新登录",
+    "NO_USAGE_DATA": "暂无明细，费用未知", "AUTH_REQUIRED": "需重新登录",
+    "NO_SELECTED_USAGE_DATA": "受管 Key 暂无明细",
+    "NO_MANAGED_KEYS": "无受管 Key，已跳过",
+    "COST_SCOPE_MISMATCH": "平台返回范围不符",
     "SESSION_UNAVAILABLE": "会话已失效", "NETWORK_ERROR": "网络读取失败",
     "HTTP_ERROR": "平台读取失败", "PLATFORM_REJECTED": "平台拒绝读取",
     "PERIOD_INCOMPLETE": "账单范围不足", "PERIOD_MISMATCH": "账单范围不符",
     "CHARGE_TYPE_UNSUPPORTED": "费用类别待适配",
+}
+COLLECTION_RESULT_CODES = frozenset(FEE_STATE_LABELS) | {
+    'OK', 'NOT_COLLECTED', 'SCHEMA_UNSUPPORTED', 'SOURCE_MISMATCH',
+    'TIMEZONE_MISMATCH', 'KEY_ID_INVALID', 'KEY_ID_UNBOUND', 'INVALID_KEY_SCOPE',
+    'BUCKET_MISALIGNED', 'BUCKET_UNSUPPORTED', 'DUPLICATE_COST_BUCKET',
+    'AMOUNT_INVALID', 'CURRENCY_UNSUPPORTED', 'REDIRECT_REJECTED',
+    'BODY_TOO_LARGE', 'CONTENT_TYPE_UNSUPPORTED',
+}
+COLLECTION_COVERAGE_FIELDS = (
+    'bound_total_count', 'active_managed_count', 'fee_tracking_count',
+    'matched_total_count', 'matched_active_count', 'matched_historical_count',
+    'active_missing_count',
+)
+COLLECTION_REJECTION_LABELS = {
+    'TARGET_IN_USE': ('其他实例占用', '平台读取已返回，但本机旧版本、其他管理器或退出清理进程仍占用目标；本次未绑定、未写入费用。请正常关闭旧管理器并等待清理完成，再在本窗口重新读取；无需改日期、清空账本或重新登录。'),
+    'TARGET_LOCK_FAILED': ('目标保护不可用', '平台读取已返回，但本机目标保护未能建立；本次未绑定、未写入费用。请查看诊断并正常退出本程序后重开；未认定为其他实例占用。'),
+    'COLLECTION_CONTEXT_CHANGED': ('读取期间设置已变化', '本次结果不属于当前账本或统计设置，未应用费用或绑定；请按当前设置重新读取。'),
+    'NO_MANAGED_BINDINGS': ('尚无受管绑定', '费用已读取，但本账本没有可接收费用的绑定；请检查人员与 Key 绑定。'),
+    'NO_BOUND_COST_MATCH': ('费用与绑定不匹配', '费用已读取，但没有匹配本账本的 Key 绑定；本次费用快照未更新，请核对绑定。'),
+    'CUMULATIVE_DECREASE': ('累计费用下降', '本次累计小于已有记录，已保留原金额并暂停管理；请核对期间或账单修订。'),
+    'SNAPSHOT_CONFLICT': ('费用来源冲突', '相同费用来源与既有内容不一致；已保留原记录，请核对来源。'),
+    'PERIOD_CONFIG_MISMATCH': ('账本期间不符', '费用期间与当前账本不一致；本次费用快照未更新，请核对统计起点。'),
+    'END_DATE_REGRESSION': ('账单截止日回退', '本次账单截止日早于已有统计；已保留原记录，请核对期间。'),
+    'STALE_SNAPSHOT_REPLAY': ('返回旧费用来源', '平台返回的是历史费用来源，账本仍采用更新的快照；本次不能刷新自动管理资格，请重新读取。'),
+    'LOCAL_CONTEXT_UNAVAILABLE': ('本地文件待恢复', '本地账本或人员表无法完成核验；已暂停管理，请恢复文件后重新读取。'),
+    'SNAPSHOT_DATA_INVALID': ('费用数据待核查', '费用标识或金额未通过账本校验；本次费用快照未更新，请核对来源。'),
 }
 STATUS_LABELS = {
     "unassigned": "待填写姓名 · 不参与管理",
@@ -158,6 +189,8 @@ class App:
         self.current_action = None
         self.interrupt_future = None
         self.collection_has_fees = False
+        self.collection_source_id = ''
+        self.collection_reason_code = ''
         self.session_generation = 0
         self.session_ready = False
         self.collection_context = None
@@ -193,7 +226,7 @@ class App:
         from .diagnostics import DiagnosticLog
         self.diagnostics_dir = self.home_folder / "临时诊断日志"
         self.diagnostics = DiagnosticLog(self.diagnostics_dir)
-        self._diagnostic("ui_opened")
+        self._diagnostic("ui_opened", **diagnostic_build_identity())
         self.root.title(f"DeepSeek 额度管理 {__version__} · 候选预发布")
         fit_window(self.root)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
@@ -301,6 +334,9 @@ class App:
         self.defaults_feedback_var = tk.StringVar(value=self.table_defaults_notice or '斩杀线最小为 0，仅预填新表个人额度；已有人员额度不变。')
         self.main_content.wrap(ttk.Label(outer, textvariable=self.defaults_feedback_var, style='Muted.TLabel', wraplength=1100)).pack(anchor='w', pady=(0, 8))
         self.main_content.wrap(ttk.Label(outer, text="强制删除只处理选中的 Key，不要求达到额度；全自动管理会周期读取并自动永久撤销达额 Key，无需逐枚人工审批。未填写姓名的行不参与管理。“立即读取”只核对数据。账单延迟与在途请求仍可能超支；真实自动撤销尚待验证。", style="Warn.TLabel", wraplength=1040)).pack(anchor="w", pady=(0, 10))
+        self.collection_summary_var = tk.StringVar(value="费用核验：尚未读取。")
+        self.main_content.wrap(ttk.Label(outer, textvariable=self.collection_summary_var,
+                                        wraplength=1040)).pack(anchor="w", pady=(0, 8))
         tabs = ttk.Notebook(outer)
         tabs.pack(fill="both", expand=True)
         overview = ttk.Frame(tabs, padding=8)
@@ -553,18 +589,22 @@ class App:
         self._update_buttons()
 
     def _audit_notice(self):
-        message = f"有 {len(self.audit_pending)} 项处理结果尚未完整保存。请恢复数据目录写入后点击“保存处理记录”；此操作仅保存账本，不会再次操作平台。"
+        if any(item['action'] == 'collect' for item in self.audit_pending):
+            message = ("费用已保存在统计库，日志导出或本地刷新尚未完成。恢复文件访问后点击“保存处理记录”完成本地恢复；"
+                       "不会再次应用费用或操作平台。自动管理保持停止，恢复后仍须重新读取费用。")
+        else:
+            message = f"有 {len(self.audit_pending)} 项处理结果尚未完整保存。请恢复数据目录写入后点击“保存处理记录”；此操作仅保存账本，不会再次操作平台。"
         self.audit_var.set(message)
         self.status_var.set(message)
         self._action_state("save_audit", "待保存")
 
-    def _queue_audit(self, callback: Callable, *, action: str, result=None):
+    def _queue_audit(self, callback: Callable, *, action: str, result=None, preserve_session=False):
         self.audit_pending.append({"callback": callback, "action": action, "result": result})
         self.audit_failed = True
         self.pending_login = self.reset_on_login = False
         self.pending_change = None
         self.stop(quiet=True)
-        self._invalidate_collection(session=True)
+        self._invalidate_collection(session=not preserve_session)
         self._diagnostic("audit_save_pending", action=action, count=len(self.audit_pending))
         self._audit_notice()
 
@@ -572,6 +612,7 @@ class App:
         if not self.audit_pending or self.busy or self.interrupting or self.closing:
             return
         self.stop(quiet=True)
+        collection_recovery = any(item['action'] == 'collect' for item in self.audit_pending)
         self._action_state("save_audit", "保存中")
         while self.audit_pending:
             item = self.audit_pending[0]
@@ -585,7 +626,9 @@ class App:
         self.audit_failed = False
         self.audit_var.set("")
         self._action_state("save_audit", "已完成")
-        self.status_var.set("处理记录已保存。自动管理保持停止；请先核实平台状态，再决定是否重新登录或关闭。")
+        self.status_var.set("费用日志与本地界面已恢复。自动管理保持停止；请重新读取费用后再决定是否启动。"
+                            if collection_recovery else
+                            "处理记录已保存。自动管理保持停止；请先核实平台状态，再决定是否重新登录或关闭。")
         self._diagnostic("audit_save_completed")
 
     def resolve_account_mismatch(self):
@@ -600,7 +643,10 @@ class App:
         self.collection_observed_monotonic = None
         self.collection_end_date = None
         self.collection_has_fees = False
+        self.collection_source_id = ''
+        self.collection_reason_code = ''
         self.action_states["collect"] = "待重新读取"
+        self._show_collection_summary('费用核验：待重新读取；已有金额可能来自旧快照，不代表本次已核验。')
         if session:
             self.pending_start = None
             self.start_refresh_required = False
@@ -608,25 +654,68 @@ class App:
             self.action_states["login"] = "待核验"
         self._update_buttons()
 
+    def _show_collection_summary(self, text):
+        variable = getattr(self, 'collection_summary_var', None)
+        if variable is not None:
+            variable.set(text)
+
+    @staticmethod
+    def _coverage_text(summary):
+        """Display only anonymous counts; this text never grants authority."""
+        values = {}
+        for field in ('platform_key_count', 'fee_tracking_count', 'matched_platform_count',
+                      'unmatched_fee_count', 'case_only_match_count'):
+            value = (summary or {}).get(field) if isinstance(summary, dict) else None
+            if type(value) is int and 0 <= value <= 1_000_000:
+                values[field] = value
+        required = {'platform_key_count', 'fee_tracking_count', 'matched_platform_count'}
+        if not required.issubset(values):
+            return ''
+        text = (f"平台列表 {values['platform_key_count']} 枚，费用记录涉及 {values['fee_tracking_count']} 枚，"
+                f"两者精确匹配 {values['matched_platform_count']} 枚。")
+        if values.get('case_only_match_count', 0):
+            text += ' 检测到 UUID 大小写表示差异，未自动合并，请核对诊断。'
+        return text
+
     def _collection_context(self):
         config = self.store.load()
         return (self.session_generation, self.folder, config.period_id, config.account_id,
                 config.start_date, config.people_count, config.total_budget, self.store.workbook_hash())
 
-    def _remember_collection(self, result):
-        self.collection_context = self._collection_context()
+    def _remember_collection(self, result, *, application=None):
+        # Publish only after every fallible read succeeds. An observation of S1
+        # must never make a later ledger snapshot S2 eligible for deletion.
+        context = self._collection_context()
+        source = ''
+        if application is not None:
+            source = application.observed_source_id
+            if (not application.fees_current or application.export_state != 'complete'
+                    or self.store.current_snapshot_id() != source):
+                raise GuardError('本次观察的费用不是当前已完成保存的快照，请重新读取。')
+        end_date = result['end_date']
+        observed_wall = result['collection_started_wall']
+        observed_monotonic = result['collection_started_monotonic']
+        if not collection_is_fresh(observed_wall, observed_monotonic, end_date):
+            raise GuardError('本地处理期间读取已过期或跨日，请重新读取。')
+        self.collection_context = context
         self.start_refresh_required = False
-        self.collection_end_date = result['end_date']
+        self.collection_end_date = end_date
         # The worker's timestamps prevent a queued result becoming "fresh"
         # merely because the UI resumed after sleep or a blocked event loop.
-        self.collection_observed_wall = result['collection_started_wall']
-        self.collection_observed_monotonic = result['collection_started_monotonic']
+        self.collection_observed_wall = observed_wall
+        self.collection_observed_monotonic = observed_monotonic
+        self.collection_source_id = source
+        self.collection_has_fees = application is not None
 
     def _collection_is_current(self):
-        return (self.collection_context == self._collection_context()
+        return (self.collection_context is not None
+                and self.collection_context == self._collection_context()
                 and collection_is_fresh(getattr(self, 'collection_observed_wall', None),
                                         getattr(self, 'collection_observed_monotonic', None),
-                                        getattr(self, 'collection_end_date', None)))
+                                        getattr(self, 'collection_end_date', None))
+                and (not self.collection_has_fees
+                     or bool(self.collection_source_id)
+                     and self.collection_source_id == self.store.current_snapshot_id()))
 
     def _watch_workbook(self):
         if self.closing:
@@ -1018,7 +1107,7 @@ class App:
         from .people_editor_ui import open_people_editor
         open_people_editor(self, initial_amount)
 
-    def check_people(self, show_dialog=True) -> bool:
+    def check_people(self, show_dialog=True, *, allow_empty=False) -> bool:
         try:
             people = self.store.read_people()
             was_recovering = self.recovery_mode
@@ -1046,7 +1135,7 @@ class App:
             self.status_var.set(message.replace("\n", " "))
             if show_dialog:
                 messagebox.showinfo("表格检查", message, parent=self.root)
-            return count > 0
+            return count > 0 or allow_empty
         except Exception as exc:
             self.validated_hash = None
             self._invalidate_collection()
@@ -1060,7 +1149,7 @@ class App:
             self.error("表格检查未通过", exc, dialog=show_dialog, next_step="请修正并保存人员表，再点击“检查表格”。")
             return False
 
-    def refresh_rows(self):
+    def refresh_rows(self, *, readonly=False):
         if not self.store or not self.config:
             return
         # Validate the ledger separately: database/settings damage is not a
@@ -1069,8 +1158,11 @@ class App:
         try:
             self.store.read_people()
         except GuardError:
+            if readonly:
+                raise
             self._enter_recovery()
-        self.rows = [] if self.recovery_mode else self.store.evaluate()
+        self.rows = ([] if self.recovery_mode else
+                     self.store.read_evaluation() if readonly else self.store.evaluate())
         # Recovery must not depend on a person still appearing in the workbook.
         for action in self.store.unresolved_actions():
             existing = next((r for r in self.rows if r.get('tracking_id') == action['tracking_id']), None)
@@ -1096,7 +1188,7 @@ class App:
                 spent = '≥' + spent + '（待补全）'
             self.tree.insert("", "end", iid=str(i), values=(row.get("name") or "（待填写）", amount, amount_text(row.get("share", self.config.share)), spent, STATUS_LABELS.get(status, status)), tags=(status,))
 
-    def refresh_events(self, *, show_status=False):
+    def refresh_events(self, *, show_status=False, strict=False):
         if not self.store or not self.config:
             return
         try:
@@ -1113,6 +1205,8 @@ class App:
                 self._action_state("reports", "已完成")
                 self.status_var.set(f"处理汇报刷新已完成，显示最近 {len(events)} 条记录。")
         except Exception as exc:
+            if strict:
+                raise
             self.status_var.set(f"汇报读取失败：{safe_error(exc)}")
 
     def _selection(self, _event=None):
@@ -1138,7 +1232,9 @@ class App:
         chosen = self.tree.selection()
         return self.rows[int(chosen[0])] if chosen else None
 
-    def _browser_action(self, action: str, on_success: Callable, on_error: Callable | None = None, on_progress: Callable | None = None, **kwargs):
+    def _browser_action(self, action: str, on_success: Callable, on_error: Callable | None = None,
+                        on_progress: Callable | None = None, on_result_error: Callable | None = None,
+                        diagnostic_operation_id='', **kwargs):
         if self.recovery_mode and action not in {'login', 'verify_revoke'}:
             self.status_var.set('恢复期间仅可登录原账户并核实已有操作；请先恢复人员表。')
             return
@@ -1156,7 +1252,8 @@ class App:
             self.stop(quiet=True)
             self._invalidate_collection(session=True)
             self.last_keys = []
-            self._diagnostic("browser_action_failed", action=action, error_type=type(exc).__name__)
+            self._diagnostic("browser_action_failed", action=action, error_type=type(exc).__name__,
+                             operation_id=diagnostic_operation_id)
             self._action_state(button_key, "失败")
             log_failure = None
             if on_error:
@@ -1197,7 +1294,8 @@ class App:
             return
         self.busy = True
         self.current_action = action
-        self._diagnostic("browser_action_started", action=action, generation=self.session_generation)
+        self._diagnostic("browser_action_started", action=action, generation=self.session_generation,
+                         operation_id=diagnostic_operation_id)
         generation = self.session_generation
         preserve_result = action in {"revoke", "verify_revoke"}
         started_at = time.monotonic()
@@ -1230,6 +1328,7 @@ class App:
                 return
             failure = log_failure = None
             result_received = False
+            result_failure_handled = False
             result = None
             try:
                 if generation != self.session_generation and not preserve_result:
@@ -1238,7 +1337,8 @@ class App:
                 result = future.result()
                 result_received = True
                 on_success(result)
-                fields = {"action": action, "elapsed": round(time.monotonic() - started_at, 2)}
+                fields = {"action": action, "elapsed": round(time.monotonic() - started_at, 2),
+                          "operation_id": diagnostic_operation_id}
                 if isinstance(result, dict):
                     if isinstance(result.get("keys"), list):
                         fields["key_count"] = len(result["keys"])
@@ -1247,7 +1347,16 @@ class App:
                 self._diagnostic("browser_action_completed", **fields)
             except Exception as exc:
                 failure = exc
-                if preserve_result and result_received:
+                if result_received and on_result_error is not None:
+                    # Transport success is distinct from a failed local apply.
+                    # Do not replay the callback: it may already have committed.
+                    try:
+                        on_result_error(exc)
+                        result_failure_handled = True
+                    except Exception as handling_exc:
+                        failure = handling_exc
+                        log_failure = failed(handling_exc)
+                elif preserve_result and result_received:
                     self.delete_permit = None
                     self._queue_audit(lambda value=result: on_success(value), action=action, result=result)
                     log_failure = exc
@@ -1264,7 +1373,7 @@ class App:
                 self.root.after(0, self._drain_pending)
             if self.audit_failed:
                 self._audit_notice()
-            elif failure is not None and not self.closing and not self.interrupting and not self.pending_login and self.pending_change is None:
+            elif failure is not None and not result_failure_handled and not self.closing and not self.interrupting and not self.pending_login and self.pending_change is None:
                 report_failure(failure, log_failure)
         self.root.after(100, poll)
 
@@ -1287,40 +1396,229 @@ class App:
         self._update_buttons()
         self.root.after(0, self._drain_pending)
 
+    def _collection_trace(self, event, operation_id, stage, *, reason_code='OK',
+                          persistence_state='not_written', application=None,
+                          coverage_summary=None, error_type=None):
+        """Only controlled result fields and aggregate counts enter diagnostics."""
+        fields = {'operation_id': operation_id, 'stage': stage, 'reason_code': reason_code,
+                  'persistence_state': persistence_state}
+        if application is not None:
+            fields.update(apply_outcome=application.apply_outcome,
+                          export_state=application.export_state,
+                          observed_source_is_effective=(application.observed_source_id
+                                                        == application.effective_snapshot_id))
+            for field in ('observed_source_id', 'effective_snapshot_id'):
+                value = getattr(application, field)
+                if isinstance(value, str) and re.fullmatch(r'[0-9a-f]{64}', value):
+                    fields[field] = value
+            coverage_summary = application.coverage_summary if coverage_summary is None else coverage_summary
+        for key in COLLECTION_COVERAGE_FIELDS:
+            value = (coverage_summary or {}).get(key)
+            if type(value) is int and value >= 0:
+                fields[key] = value
+        if error_type:
+            fields['error_type'] = error_type
+        self._diagnostic(event, **fields)
+
+    def _recover_collection_application(self, store, operation_id):
+        """Finish local work only. Never reapply or publish a new observation."""
+        if self.store is not store:
+            raise GuardError('待恢复的费用属于另一个账本，请返回原账本。')
+        store.export_logs()
+        self._collection_context()
+        self.refresh_rows(readonly=True)
+        self.refresh_events(strict=True)
+        self._invalidate_collection()
+        self._action_state('collect', '本地已恢复，待重新读取')
+        self._collection_trace('collection_recovery_completed', operation_id, 'local_recovery',
+                               persistence_state='persisted')
+
+    def _collection_application_failed(self, exc, *, operation_id, state):
+        """A returned platform result can fail locally without losing login."""
+        application = state.get('application')
+        stage = state['stage']
+        persistence = 'persisted' if application is not None else 'not_written'
+        reason = 'LOCAL_APPLICATION_FAILED'
+        coverage = None
+        if isinstance(exc, SnapshotApplyError):
+            reason = exc.reason_code
+            stage = exc.stage
+            persistence = exc.persistence_state
+            application = exc.application or application
+            coverage = exc.coverage_summary
+        elif stage == 'target_lock_acquisition':
+            reason = 'TARGET_IN_USE' if isinstance(exc, TargetLockError) else 'TARGET_LOCK_FAILED'
+        elif application is not None:
+            reason = 'POST_COMMIT_REFRESH_FAILED'
+        elif stage in {'local_context', 'identity_refresh'} and isinstance(exc, GuardError):
+            reason = 'LOCAL_CONTEXT_UNAVAILABLE'
+        elif stage == 'snapshot_validation':
+            # An unexpected exception may have escaped after a commit. Do not
+            # infer rollback from the absence of a returned application object.
+            persistence = 'unknown'
+            reason = 'SNAPSHOT_PERSISTENCE_UNKNOWN'
+        allowed_reasons = set(COLLECTION_REJECTION_LABELS) | {
+            'ACCOUNT_NOT_BOUND', 'AUDIT_EXPORT_FAILED', 'POST_COMMIT_REFRESH_FAILED',
+            'SNAPSHOT_PERSISTENCE_UNKNOWN', 'LOCAL_APPLICATION_FAILED',
+        }
+        if reason not in allowed_reasons:
+            reason, persistence = 'LOCAL_APPLICATION_FAILED', 'unknown'
+        if persistence not in {'not_written', 'persisted', 'unknown'}:
+            persistence = 'unknown'
+        if stage not in {'collection_received', 'local_context', 'target_lock_acquisition', 'binding_verification',
+                         'identity_refresh', 'snapshot_validation', 'snapshot_transaction',
+                         'audit_export', 'post_commit_refresh', 'post_commit_context',
+                         'collection_publication'}:
+            stage = 'local_context'
+        recoverable = (persistence == 'persisted' and application is not None
+                       and reason in {'AUDIT_EXPORT_FAILED', 'POST_COMMIT_REFRESH_FAILED'})
+        preserve_session = (state.get('identity_verified', False)
+                            and persistence != 'unknown'
+                            and (reason in COLLECTION_REJECTION_LABELS or recoverable))
+        self.stop(quiet=True)
+        self.delete_permit = None
+        self._invalidate_collection(session=not preserve_session)
+        self.collection_reason_code = reason
+        self.last_keys = []
+        self._collection_trace('collection_application_failed', operation_id, stage,
+                               reason_code=reason, persistence_state=persistence,
+                               application=application, coverage_summary=coverage,
+                               error_type=type(exc).__name__)
+        if recoverable:
+            store = self.store
+            self._queue_audit(lambda: self._recover_collection_application(store, operation_id),
+                              action='collect', result={'operation_id': operation_id,
+                                                        'persistence_state': 'persisted'},
+                              preserve_session=preserve_session)
+            self._action_state('collect', '已入账，本地恢复待完成')
+        elif isinstance(exc, AccountMismatch):
+            self.account_mismatch = exc
+            self._action_state('account_ledger', '待选择')
+            self._action_state('collect', '账户与账本不一致')
+            self.error('账户与当前账本不一致', exc, dialog=False,
+                       next_step='请重新登录原账户，或为当前账户建立独立账本。')
+        elif reason in COLLECTION_REJECTION_LABELS:
+            label, message = COLLECTION_REJECTION_LABELS[reason]
+            self._action_state('collect', label)
+            self.status_var.set(message + ' 自动管理已停止，旧删除许可已清除。')
+        elif persistence == 'unknown':
+            self._action_state('collect', '保存结果待核实')
+            self.status_var.set('费用已经取回，但本次保存结果待核实；不能认定未写入。请先核对本地账本，自动管理保持停止。')
+        else:
+            self._action_state('collect', '本地处理失败')
+            self.error('费用已取回，本地处理失败', exc, dialog=False,
+                       next_step='自动管理已停止；请核对本地文件与绑定后重新读取。')
+        period = state.get('period_label', '')
+        if reason == 'NO_BOUND_COST_MATCH':
+            text = (f'费用核验：{period}平台已返回费用，但未匹配本账本绑定。'
+                    '原累计保留，本次未入账，未匹配费用仍未知；不代表账户已更换。')
+            text += ' ' + self._coverage_text(state.get('platform_coverage'))
+            self._show_collection_summary(text.strip())
+        else:
+            self._show_collection_summary(f'费用核验：{period}{self.action_states.get("collect", "未完成")}。'
+                                          '本次未取得可用于自动处理的新费用依据。')
+
     def collect(self, *, after_read=None):
         if self.recovery_mode or self.busy or not self.config or self.pending_login or self.pending_change is not None or self.closing or self.interrupting or self.cleanup_failed or self.audit_failed:
             return
         self._cancel_collection_poll()
-        if not self.check_people(show_dialog=False):
+        if not self.check_people(show_dialog=False, allow_empty=True):
             self.stop(quiet=True)
             return
         checked_hash = self.validated_hash
-        self.collection_context = None
+        self._invalidate_collection()
+        operation_id = uuid4().hex
+        state = {'stage': 'collection_received', 'application': None, 'identity_verified': False}
+        requested_store = self.store
+        try:
+            requested_context = self._collection_context()
+            managed_names = [person.name for person in self.store.read_people()
+                             if person.name and person.amount >= 0]
+        except Exception as exc:
+            state['stage'] = 'local_context'
+            self._collection_application_failed(exc, operation_id=operation_id, state=state)
+            return
+        if not managed_names:
+            self.stop(quiet=True)
+            self.collection_reason_code = 'NO_MANAGED_KEYS'
+            self._action_state('collect', FEE_STATE_LABELS['NO_MANAGED_KEYS'])
+            self._show_collection_summary('费用核验：没有已填写且额度不为 -1 的 Key；未发送费用请求。')
+            self.status_var.set('未填写或额度为 -1 的行不查询费用、不参与自动管理。')
+            self._diagnostic('cost_collection_skipped', reason_code='NO_MANAGED_KEYS', count=0)
+            return
+        requested_start = requested_context[4]
+        self._show_collection_summary(f'费用核验：正在查询 {len(managed_names)} 个受管名称、'
+                                      f'{requested_start} 起的费用；未填写和 -1 的行不查询。')
 
         def done(result):
+            incoming_reason = result.get('reason_code', 'OK')
+            if not isinstance(incoming_reason, str) or incoming_reason not in COLLECTION_RESULT_CODES:
+                incoming_reason = 'UNKNOWN_COLLECTION_RESULT'
+            self._collection_trace('collection_result_received', operation_id, 'collection_received',
+                                   reason_code=incoming_reason)
+            state['stage'] = 'local_context'
             if not collection_is_fresh(result.get('collection_started_wall'),
                                        result.get('collection_started_monotonic'), result['end_date']):
                 raise ValueError('本次读取已过期或跨日，未应用费用；请重新读取。')
             if self.store.workbook_hash() != checked_hash:
                 raise ValueError("读取平台期间表格发生变化。本次结果未应用，请重新检查。")
+            if (self.store is not requested_store or self._collection_context() != requested_context
+                    or result.get('start_date') != requested_start):
+                raise SnapshotApplyError('采集期间账本、身份或统计设置已变化，未应用本次绑定或费用。',
+                                         reason_code='COLLECTION_CONTEXT_CHANGED', stage='local_context',
+                                         persistence_state='not_written', operation_id=operation_id)
+            state['period_label'] = f"{requested_start} 至 {result['end_date']}（UTC+8），"
+            state['platform_coverage'] = result.get('coverage_summary')
+            state['stage'] = 'target_lock_acquisition'
             self._claim_targets(result['keys'])
+            self._collection_trace('collection_targets_claimed', operation_id, 'target_lock_acquisition')
+            state['stage'] = 'binding_verification'
             self.store.bind_keys(result["keys"], account_id=result["account_id"])
+            if 'requested_tracking_ids' in result:
+                expected = {item['tracking_id'] for item in self.store.active_bindings()
+                            if item['name'] in managed_names}
+                actual = result['requested_tracking_ids']
+                if (not isinstance(actual, list) or len(actual) != len(expected)
+                        or any(not isinstance(key, str) for key in actual) or set(actual) != expected
+                        or result.get('totals') is not None
+                        and not set(result['totals']).issubset(expected)):
+                    raise SnapshotApplyError('返回的费用查询范围不属于当前受管绑定，未应用费用。',
+                                             reason_code='COLLECTION_CONTEXT_CHANGED',
+                                             stage='binding_verification', persistence_state='not_written')
             self.session_ready = True
+            state['identity_verified'] = True
             self._action_state("login", "已核验")
-            self._remember_collection(result)
-            self.collection_has_fees = result.get('totals') is not None
+            self._collection_trace('collection_identity_verified', operation_id, 'binding_verification')
             if result.get('totals') is None:
+                state['stage'] = 'identity_refresh'
                 self.retry_collection = bool(result.get('retryable'))
                 self.last_keys = result['keys']
-                self.refresh_rows()
-                self.refresh_events()
+                self.refresh_rows(readonly=True)
+                self.refresh_events(strict=True)
+                self._remember_collection(result)
                 reason = result.get('reason_code', 'SCHEMA_UNSUPPORTED')
+                self.collection_reason_code = reason
                 self._action_state("collect", FEE_STATE_LABELS.get(reason, "费用结构待核验"))
+                if reason == 'NO_SELECTED_USAGE_DATA':
+                    self._show_collection_summary(f"费用核验：{state['period_label']}指定受管 Key 暂无费用明细；"
+                                                  '实际费用仍未知，没有按零元入账，也不认定绑定错误。')
+                elif reason == 'NO_MANAGED_KEYS':
+                    self._show_collection_summary('费用核验：受管目标当前均不在平台列表中，未发送费用请求。')
+                elif reason == 'NO_USAGE_DATA':
+                    self._show_collection_summary(f"费用核验：{state['period_label']}平台成功返回空明细；"
+                                                  '实际费用仍未知，没有按零元入账。')
+                elif reason == 'PLATFORM_REJECTED':
+                    self._show_collection_summary(f"费用核验：{state['period_label']}平台业务层拒绝本次查询，"
+                                                  '具体原因未确认；不是已确认的账户不匹配，请查看诊断。')
+                else:
+                    self._show_collection_summary(f"费用核验：{state['period_label']}"
+                                                  f"{FEE_STATE_LABELS.get(reason, '费用未核验')}；原累计保留。")
                 self.status_var.set(result.get('message', '未取得可核验费用。') +
                                     ' 费用未核验，仅身份核验有效时的零额度可处理；未知费用不按零元计算。')
                 self._diagnostic('collection_unavailable', reason_code=reason,
                                  retryable=self.retry_collection,
-                                 start_date=result['start_date'], end_date=result['end_date'])
+                                 start_date=result['start_date'], end_date=result['end_date'],
+                                 operation_id=operation_id)
                 if reason in {'AUTH_REQUIRED', 'SESSION_UNAVAILABLE', 'REDIRECT_REJECTED'}:
                     self.stop(quiet=True)
                     self._invalidate_collection(session=True)
@@ -1332,12 +1630,36 @@ class App:
                     self.root.after(0, after_read)
                 return
             self.retry_collection = True
-            self.store.apply_snapshot(result["totals"], result["source_id"], result["start_date"], result["end_date"])
-            self._remember_collection(result)
-            self._action_state("collect", "成功")
+            state['stage'] = 'snapshot_validation'
+            application = self.store.apply_snapshot_result(
+                result["totals"], result["source_id"], result["start_date"], result["end_date"],
+                operation_id=operation_id)
+            state['application'] = application
+            self._collection_trace('collection_snapshot_result', operation_id, 'audit_export',
+                                   reason_code=application.reason_code,
+                                   persistence_state=application.persistence_state, application=application)
+            if not application.fees_current:
+                raise SnapshotApplyError('历史费用来源不能刷新当前账本的管理资格。',
+                                         reason_code='STALE_SNAPSHOT_REPLAY', stage='snapshot_validation',
+                                         persistence_state=application.persistence_state,
+                                         application=application, operation_id=operation_id)
+            state['stage'] = 'post_commit_refresh'
             self.last_keys = result["keys"]
-            self.refresh_rows()
-            self.refresh_events()
+            self.refresh_rows(readonly=True)
+            self.refresh_events(strict=True)
+            state['stage'] = 'post_commit_context'
+            self._remember_collection(result, application=application)
+            state['stage'] = 'collection_publication'
+            self._action_state("collect", "成功")
+            self.collection_reason_code = 'OK'
+            coverage = application.coverage_summary
+            self._show_collection_summary(
+                f"费用核验：{state['period_label']}费用已应用；"
+                f"当前受管 {coverage.get('active_managed_count', 0)} 枚，"
+                f"本次匹配 {coverage.get('matched_active_count', 0)} 枚，"
+                f"未覆盖 {coverage.get('active_missing_count', 0)} 枚。未覆盖费用保留未知或历史下界。")
+            self._collection_trace('collection_application_completed', operation_id, 'collection_publication',
+                                   persistence_state='persisted', application=application)
             now = datetime.now(TZ).strftime("%H:%M:%S")
             reached = sum(row.get("status") == "triggered" for row in self.rows)
             unknown = sum(row.get('status') == 'unknown' for row in self.rows)
@@ -1348,8 +1670,13 @@ class App:
                 self._schedule_processing()
             if after_read is not None:
                 self.root.after(0, after_read)
-        self._browser_action("collect", done, start_date=self.config.start_date,
-                             account_id=self.store.load().account_id,
+        self._browser_action("collect", done,
+                             on_result_error=lambda exc: self._collection_application_failed(
+                                 exc, operation_id=operation_id, state=state),
+                             diagnostic_operation_id=operation_id, operation_id=operation_id,
+                             start_date=requested_start,
+                             managed_names=managed_names,
+                             account_id=requested_context[3],
                              known_keys=self.store.active_tracking_ids())
 
     def start(self):
@@ -1596,8 +1923,12 @@ class App:
             if self.retry_collection:
                 self._schedule_collection_poll()
             else:
+                self._diagnostic('automatic_management_stopped',
+                                 reason_code=getattr(self, 'collection_reason_code', '') or 'FEES_UNAVAILABLE',
+                                 stage='automatic_quota_check', count=0,
+                                 complete=self.collection_has_fees, retryable=False)
                 self.stop(quiet=True)
-                self.status_var.set('已处理可确定达到额度的人员；费用来源未通过核验，管理暂停，请查看读取状态与诊断记录。')
+                self.status_var.set('费用未通过核验，且当前没有可自动处理的目标；全自动管理已停止。请查看读取状态与诊断记录。')
             return
         self._execute_revoke(targets[0])
 

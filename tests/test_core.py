@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from openpyxl import load_workbook
-from quota_guard.core import AccountMismatch, Config, DataStore, GuardError, Person, TZ, money
+from quota_guard.core import AccountMismatch, Config, DataStore, GuardError, Person, SnapshotApplyError, TZ, money
 
 
 class CoreTests(unittest.TestCase):
@@ -344,8 +344,9 @@ class CoreTests(unittest.TestCase):
         self.people(("甲", 80))
         self.bind("甲")
         with patch.object(self.store, "_record_triggers", side_effect=RuntimeError("simulated interruption")):
-            with self.assertRaises(RuntimeError):
+            with self.assertRaises(SnapshotApplyError) as caught:
                 self.snapshot({"甲": 90})
+        self.assertEqual(caught.exception.reason_code, "SNAPSHOT_PERSISTENCE_UNKNOWN")
         restored = DataStore(self.folder)
         self.assertIsNone(restored.evaluate()[0]["spent"])
         self.assertFalse(any(e["kind"] == "snapshot" for e in restored.events()))

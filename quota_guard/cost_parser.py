@@ -1,10 +1,11 @@
 """Decode observed console costs without making requests or writing a ledger.
 
-Production still rejects nonempty function_series. The separately named offline
-candidate follows the saved official client (4179.a95866c86d.js): uT at character
-offset 521149 maps both series leaves, 566854 maps function_series, and 570517
-adds both categories. This static evidence is not a real Search/Fetch bill or a
-guarantee of complete server accounting. No environment or UI switch enables it.
+Production sums model and function bucket costs through the same strict leaf
+validator. The saved official client (4179.a95866c86d.js) maps both leaves at
+character offset 521149, maps function_series at 566854 and sums both categories
+at 570517. No usage-count pricing or guessed function names are involved.
+Supporting this observed schema is not a guarantee of complete server billing
+or real-account acceptance; local identity and action guards remain separate.
 """
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -13,7 +14,7 @@ import re
 from urllib.parse import parse_qs, urlparse
 
 from .core import GuardError, TZ, money
-from .platform_http import CostReadError, is_cost_endpoint
+from .platform_http import CostReadError, is_cost_endpoint, normalize_cost_scope
 
 
 _KEY_ID = re.compile(r'[A-Za-z0-9_-]{8,200}')
@@ -33,7 +34,8 @@ class OfflineFunctionCostCandidate:
 
     Missing keys are explicitly absent from totals, not filled with zero. Even
     when none are missing, production_validated remains False: a syntactically
-    valid fixture cannot prove actual tool categories or complete billing.
+    valid fixture is not a real-account acceptance result. This field does not
+    enable or disable the production parser, which uses the same leaf rules.
     """
     totals: dict[str, Decimal]
     category_totals: dict[str, dict[str, Decimal]]
@@ -47,7 +49,7 @@ def _valid_key(value):
 
 
 def _accumulate_series(series, category, totals, seen, *, left, right, begin,
-                       finish, seconds, expected_keys):
+                       finish, seconds, expected_keys, scoped=False):
     """One leaf validator for model and function costs; never infer unit prices."""
     if not isinstance(series, list):
         raise CostReadError('费用计费分类不是列表，未应用数据。', reason_code='SCHEMA_UNSUPPORTED')
@@ -56,10 +58,13 @@ def _accumulate_series(series, category, totals, seen, *, left, right, begin,
         if not _valid_key(key):
             raise CostReadError('费用中缺少合法 Tracking ID。', reason_code='KEY_ID_INVALID')
         if expected_keys is not None and key not in expected_keys:
+            if scoped:
+                raise CostReadError('平台返回了指定受管范围之外的费用，未应用本次结果；不会退回全账户查询。',
+                                    reason_code='COST_SCOPE_MISMATCH')
             raise CostReadError('离线样本含未明确绑定的 Tracking ID，不分摊其费用。',
                                 reason_code='KEY_ID_UNBOUND')
         model = entry['model']
-        if not isinstance(model, str) or not model:
+        if not isinstance(model, str) or not model.strip():
             raise CostReadError('费用中缺少计费分类。', reason_code='SCHEMA_UNSUPPORTED')
         if not isinstance(entry['buckets'], list):
             raise CostReadError('费用分桶明细不是列表，未应用数据。', reason_code='SCHEMA_UNSUPPORTED')
@@ -84,14 +89,19 @@ def _accumulate_series(series, category, totals, seen, *, left, right, begin,
                 totals[key] = totals.get(key, Decimal(0)) + cost
 
 
-def _parse_categories(payload, url, start_date, end_date, *, offline_functions,
-                      expected_keys=None):
+def _parse_categories(payload, url, start_date, end_date, *, expected_keys=None, tracking_ids=None):
     parsed = urlparse(url)
     query = parse_qs(parsed.query)
     if not is_cost_endpoint(url):
         raise CostReadError('不是预期的平台费用来源。', reason_code='SOURCE_MISMATCH')
     if query.get('tz') != ['28800']:
         raise CostReadError('平台费用时区不是 UTC+8，本次费用未应用。', reason_code='TIMEZONE_MISMATCH')
+    if tracking_ids is not None:
+        expected_keys = frozenset(normalize_cost_scope(tracking_ids))
+        requested = query.get('api_key_tracking_id', [])
+        if len(requested) != len(expected_keys) or set(requested) != expected_keys:
+            raise CostReadError('费用请求与本次受管 Key 范围不一致，未应用数据。',
+                                reason_code='COST_SCOPE_MISMATCH')
     begin = int(datetime.fromisoformat(start_date).replace(tzinfo=TZ).timestamp())
     finish = int((datetime.fromisoformat(end_date).replace(tzinfo=TZ)
                   + timedelta(days=1)).timestamp())
@@ -99,7 +109,8 @@ def _parse_categories(payload, url, start_date, end_date, *, offline_functions,
         if type(payload['code']) is not int or type(payload['data']['biz_code']) is not int:
             raise CostReadError('平台费用状态结构变化，未更新费用。', reason_code='SCHEMA_UNSUPPORTED')
         if payload['code'] != 0 or payload['data']['biz_code'] != 0:
-            raise CostReadError('平台未返回成功费用结果，请检查登录状态。', reason_code='PLATFORM_REJECTED')
+            raise CostReadError('平台拒绝本次费用查询，具体业务原因尚未确认；原费用保留，请核对统计日期与诊断记录。',
+                                reason_code='PLATFORM_REJECTED')
         data = payload['data']['biz_data']
         left, right = data['start'], data['end']
         if type(left) is not int or type(right) is not int or left > begin or right < finish:
@@ -114,6 +125,11 @@ def _parse_categories(payload, url, start_date, end_date, *, offline_functions,
             raise CostReadError('暂不支持该费用时间分桶，未应用数据。', reason_code='BUCKET_UNSUPPORTED')
         if query.get('start') != [str(left)] or query.get('end') != [str(right)]:
             raise CostReadError('平台请求与返回时间范围不一致。', reason_code='PERIOD_MISMATCH')
+        function_metadata = data.get('functions', [])
+        if (not isinstance(function_metadata, list)
+                or any(not isinstance(value, str) or not value.strip() for value in function_metadata)):
+            raise CostReadError('平台函数计费分类结构变化，未应用不完整金额。',
+                                reason_code='SCHEMA_UNSUPPORTED')
         groups = data['data']
         if not isinstance(groups, list):
             raise CostReadError('费用结构不是列表，未应用数据。', reason_code='SCHEMA_UNSUPPORTED')
@@ -126,15 +142,23 @@ def _parse_categories(payload, url, start_date, end_date, *, offline_functions,
             for group in groups:
                 if group['currency'] != 'CNY':
                     raise CostReadError('存在非人民币费用，不能混合相加。', reason_code='CURRENCY_UNSUPPORTED')
+                if function_metadata and _FUNCTION_SERIES not in group:
+                    raise CostReadError('平台声明了函数计费分类，但缺少对应明细，未应用不完整金额。',
+                                        reason_code='SCHEMA_UNSUPPORTED')
+                if any(isinstance(name, str) and name.endswith('_series')
+                       and name != _FUNCTION_SERIES for name in group):
+                    raise CostReadError('费用包含未识别的明细类别，未应用不完整金额。',
+                                        reason_code='CHARGE_TYPE_UNSUPPORTED')
                 functions = group.get(_FUNCTION_SERIES, [])
-                if not isinstance(functions, list) or functions and not offline_functions:
-                    raise CostReadError('费用包含尚未支持的函数计费明细，未应用不完整金额。',
+                if not isinstance(functions, list):
+                    raise CostReadError('平台函数费用明细不是列表，未应用不完整金额。',
                                         reason_code='CHARGE_TYPE_UNSUPPORTED')
                 for category, series in ((_MODEL_SERIES, group[_MODEL_SERIES]),
                                          (_FUNCTION_SERIES, functions)):
                     _accumulate_series(series, category, categories[category], seen,
                                        left=left, right=right, begin=begin, finish=finish,
-                                       seconds=seconds, expected_keys=expected_keys)
+                                       seconds=seconds, expected_keys=expected_keys,
+                                       scoped=tracking_ids is not None)
         if not any(categories.values()):
             raise NoUsageData('所选预算周期没有可核验的逐 Key 费用记录。')
         return categories
@@ -145,15 +169,25 @@ def _parse_categories(payload, url, start_date, end_date, *, offline_functions,
                             reason_code='SCHEMA_UNSUPPORTED') from None
 
 
-def parse_cost_response(payload, url, start_date, end_date):
-    """Production decoder: retain the nonempty-function rejection boundary."""
-    return _parse_categories(payload, url, start_date, end_date,
-                             offline_functions=False)[_MODEL_SERIES]
+def _sum_categories(categories):
+    totals = {}
+    with localcontext() as context:
+        context.prec = 50
+        for subtotal in categories.values():
+            for key, amount in subtotal.items():
+                totals[key] = totals.get(key, Decimal(0)) + amount
+    return totals
+
+
+def parse_cost_response(payload, url, start_date, end_date, *, tracking_ids=None):
+    """Sum actual model/function costs; malformed parts reject the whole report."""
+    return _sum_categories(_parse_categories(payload, url, start_date, end_date,
+                                             tracking_ids=tracking_ids))
 
 
 def parse_cost_response_with_functions_offline(payload, url, start_date, end_date,
                                                *, expected_tracking_ids):
-    """Parse explicit synthetic/redacted samples without enabling production.
+    """Return category detail for explicit offline samples, not an action permit.
 
     The caller must supply all known identity bindings for this offline sample.
     Unknown identities are rejected, missing identities remain missing, and the
@@ -167,12 +201,6 @@ def parse_cost_response_with_functions_offline(payload, url, start_date, end_dat
             or len(set(expected_tracking_ids)) != len(expected_tracking_ids)):
         raise CostReadError('离线候选需要明确且唯一的 Tracking ID 绑定。', reason_code='KEY_ID_INVALID')
     expected = frozenset(expected_tracking_ids)
-    categories = _parse_categories(payload, url, start_date, end_date,
-                                   offline_functions=True, expected_keys=expected)
-    totals = {}
-    with localcontext() as context:
-        context.prec = 50
-        for subtotal in categories.values():
-            for key, amount in subtotal.items():
-                totals[key] = totals.get(key, Decimal(0)) + amount
+    categories = _parse_categories(payload, url, start_date, end_date, expected_keys=expected)
+    totals = _sum_categories(categories)
     return OfflineFunctionCostCandidate(totals, categories, expected.difference(totals))

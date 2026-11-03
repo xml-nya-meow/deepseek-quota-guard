@@ -62,6 +62,33 @@ BUILD-INFO.json
 *.bak
 *.tmp
 
+# Browser profiles and captured authentication/session material
+Cookies
+Cookies-journal
+Login Data
+Login Data-journal
+Login Data For Account
+Login Data For Account-journal
+Local State
+Preferences
+Secure Preferences
+Web Data
+Web Data-journal
+History
+History-journal
+Session Storage/
+SessionStorage/
+Local Storage/
+IndexedDB/
+Service Worker/
+Sessions/
+DevToolsActivePort
+.auth/
+storage_state*.json
+storage-state*.json
+browser-state*.json
+*.har
+
 # Editor and operating-system files
 .vscode/
 .idea/

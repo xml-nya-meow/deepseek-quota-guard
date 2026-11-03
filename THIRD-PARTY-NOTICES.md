@@ -12,7 +12,7 @@
 
 直接与传递依赖的完整版本以仓库根目录的 `requirements.lock` 为准。浏览器组件版本从已安装 Playwright 的清单解析；每次便携构建会在 `BUILD-INFO.json` 中记录 Python、依赖与浏览器 revision，不包含构建机器用户名或路径。
 
-本文件记录第三方组件与来源，不替代本项目自身的许可证。
+本文件记录第三方组件与来源，不替代本项目自身的许可证。本项目自身代码自 `0.1.0rc6.dev11` 起采用 [Apache License 2.0](LICENSE)，署名为 Copyright (c) 2026 xml-nya-meow，见 [NOTICE](NOTICE)。这是项目自身授权的变更，不改变上述第三方组件的许可证；第三方原有 MIT、Apache 或其他许可文本与版权声明均保留。此前已经按 MIT 发布的项目版本仍以其随附许可为准，不追溯改写。
 
 `third_party/` 保存 [Tcl core-8-6-12 原始许可](https://github.com/tcltk/tcl/blob/core-8-6-12/license.terms) 和 [Tcl core-8-6-15 原始许可](https://github.com/tcltk/tcl/blob/core-8-6-15/license.terms)，用于补齐对应运行时可能缺少的许可原文。构建优先使用运行时附带许可，记录实际 Tcl 版本；其他 Tcl 版本缺少许可时会停止构建。
 

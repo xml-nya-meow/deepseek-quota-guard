@@ -151,6 +151,8 @@ def build(args: argparse.Namespace) -> Path:
     if python_version not in PYTHON_VERSIONS:
         raise RuntimeError(f"Use one of the supported Python versions: {', '.join(sorted(PYTHON_VERSIONS))}.")
     versions = locked_dependencies()
+    from quota_guard.build_identity import source_build_identity
+    build_identity = source_build_identity(ROOT)
     output = args.output.expanduser().resolve()
     runtime = args.runtime.expanduser().resolve()
     if output.exists():
@@ -190,7 +192,7 @@ def build(args: argparse.Namespace) -> Path:
         license_info = copy_notices(bundle, versions)
         (bundle / "templates").mkdir()
         shutil.copy2(template, bundle / "templates" / template.name)
-        for name in ("README.md", "使用说明.md", "验证计划.md", "THIRD-PARTY-NOTICES.md", "LICENSE"):
+        for name in ("README.md", "使用说明.md", "验证计划.md", "THIRD-PARTY-NOTICES.md", "LICENSE", "NOTICE"):
             source = ROOT / name
             if source.is_file():
                 shutil.copy2(source, bundle / name)
@@ -199,6 +201,7 @@ def build(args: argparse.Namespace) -> Path:
                 (bundle / "docs").mkdir(exist_ok=True)
                 shutil.copy2(source, bundle / "docs" / source.name)
         (bundle / "BUILD-INFO.json").write_text(json.dumps({
+            **build_identity,
             "application_version": __import__('quota_guard').__version__,
             "python": python_version, "platform": "Windows x64",
             "dependencies": versions, "browser_revisions": revisions,

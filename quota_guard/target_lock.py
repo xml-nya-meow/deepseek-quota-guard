@@ -19,6 +19,15 @@ _PREFIX = "Global\\DeepSeekQuotaGuard.VerifiedTarget.v1."
 _EXISTS = 183
 
 
+class TargetLockError(GuardError):
+    """A known competing owner, distinct from access/cleanup failures."""
+    reason_code = 'TARGET_IN_USE'
+
+    def __init__(self):
+        super().__init__('同一平台目标正由本机另一个管理器或其退出清理进程占用；'
+                         '请正常关闭旧版本或其他管理器，等待清理完成后重新读取费用。')
+
+
 def _targets(values):
     if isinstance(values, (str, bytes)):
         raise GuardError("目标互斥需要完整 Tracking ID 集合。")
@@ -90,7 +99,7 @@ class _WindowsMutexBackend:
         if error == _EXISTS:
             if not self.api.CloseHandle(handle):
                 raise GuardError("无法关闭冲突目标的互斥句柄，请退出本程序后重试。")
-            raise GuardError("同一平台目标正由本机另一个管理器占用；请先关闭该实例。")
+            raise TargetLockError()
         return _Handle(handle)
 
     def release(self, handle):

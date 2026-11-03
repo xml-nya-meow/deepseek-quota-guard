@@ -205,6 +205,29 @@ def cost_query_matches(url, start_date, end_date):
             and query.get('tz') == ['28800'])
 
 
+def cost_identity_coverage(keys, totals):
+    """Read-only set diagnostics, never normalize identifiers used for billing.
+
+    Case-folding is only a comparison of complete UUID spellings. Opaque IDs
+    still require exact equality, and these counts cannot authorize an action.
+    """
+    platform_ids = {key['tracking_id'] for key in keys}
+    fee_ids = set(totals)
+    matched = fee_ids.intersection(platform_ids)
+    platform_uuids = {key.lower() for key in platform_ids if UUID_PATTERN.fullmatch(key)}
+    case_only = sum(key not in platform_ids and bool(UUID_PATTERN.fullmatch(key))
+                    and key.lower() in platform_uuids for key in fee_ids)
+    return {
+        'platform_key_count': len(platform_ids),
+        'fee_tracking_count': len(fee_ids),
+        'matched_platform_count': len(matched),
+        'unmatched_fee_count': len(fee_ids - platform_ids),
+        'missing_platform_count': len(platform_ids - fee_ids),
+        'uuid_casefold_match_count': len(matched) + case_only,
+        'case_only_match_count': case_only,
+    }
+
+
 class BrowserService:
     """All Playwright objects stay on one worker thread; UI receives Futures."""
     def __init__(self, diagnostics_dir=None):
@@ -237,6 +260,9 @@ class BrowserService:
     def _log(self, event, **fields):
         logger = getattr(self, 'diagnostics', None)
         if logger is not None:
+            operation = getattr(self, '_diagnostic_operation_id', None)
+            if operation:
+                fields.setdefault('operation_id', operation)
             logger.emit(event, **fields)
 
     def _worker(self):
@@ -259,6 +285,9 @@ class BrowserService:
                 action, args, future = task
                 if not future.set_running_or_notify_cancel():
                     continue
+                operation = args.get('operation_id') if action == 'collect' else None
+                self._diagnostic_operation_id = (operation if isinstance(operation, str)
+                                                 and re.fullmatch('[0-9a-f]{32}', operation) else None)
                 self.progress = {'stage': '正在开始操作', 'started_at': time.monotonic()}
                 self._log('browser_action_started', action=action, pid=os.getpid(), args=args)
                 entered_action = False
@@ -298,6 +327,8 @@ class BrowserService:
                               error_type=type(exc).__name__)
                     future.set_exception(exc if isinstance(exc, GuardError) else GuardError(
                         '平台操作未完成，请检查网络、登录状态或页面是否改版。未确认任何删除成功。'))
+                finally:
+                    self._diagnostic_operation_id = None
         finally:
             self._dispose_browser()
 
@@ -489,7 +520,15 @@ class BrowserService:
         self.known_keys = {key['tracking_id'] for key in keys}
         return {'keys': keys, 'account_id': identity}
 
-    def _collect(self, start_date, account_id='', known_keys=()):
+    def _collect(self, start_date, account_id='', known_keys=(), operation_id='', managed_names=None):
+        # GUI collection always supplies the validated roster scope. None is
+        # retained only for legacy/offline adapter callers, never as a fallback.
+        if managed_names is not None:
+            if (not isinstance(managed_names, (list, tuple)) or not managed_names
+                    or any(not isinstance(name, str) or not name or clean_name(name) != name
+                           for name in managed_names)
+                    or len(set(managed_names)) != len(managed_names)):
+                raise GuardError('费用读取没有明确且唯一的受管名单，未发送费用请求。')
         self._check_login_ready()
         started_wall, started_monotonic = time.time(), time.monotonic()
         keys = self._keys()
@@ -501,6 +540,14 @@ class BrowserService:
         self.anchor = key_fingerprint(keys)
         self.known_keys = {k['tracking_id'] for k in keys}
         end = datetime.now(TZ).date().isoformat()
+        selected_ids = None
+        if managed_names is not None:
+            selected_ids = []
+            for name in managed_names:
+                matches = [key['tracking_id'] for key in keys if key['name'] == name]
+                if len(matches) > 1:
+                    raise GuardError('受管姓名在平台对应多个 Key，未发送费用请求。')
+                selected_ids.extend(matches)
         reader = getattr(self, '_cost_reader', None)
         if reader is not None and getattr(self, '_cost_reader_identity', None) != identity:
             reader.clear()
@@ -514,16 +561,40 @@ class BrowserService:
                   'collection_started_wall': started_wall,
                   'collection_started_monotonic': started_monotonic,
                   'message': 'Key 列表已读取；尚未取得可核验的完整周期费用。'}
+        if selected_ids is not None:
+            result['requested_tracking_ids'] = selected_ids
+            self._log('cost_scope_selected', count=len(selected_ids),
+                      scope_kind='managed_keys', operation_id=operation_id)
+            if not selected_ids:
+                # The UI still binds/reconciles the complete identity list. It
+                # distinguishes absent retired targets from invalid roster names.
+                result.update(reason_code='NO_MANAGED_KEYS',
+                              message='本次没有可查询的受管 Key，未发送费用请求。')
+                return result
         payload = None
         self._log('cost_http_started', start_date=start_date, end_date=end,
                   request_start=int(datetime.fromisoformat(start_date).replace(tzinfo=TZ).timestamp()),
-                  request_end=int((datetime.fromisoformat(end).replace(tzinfo=TZ) + timedelta(days=1)).timestamp()))
+                  request_end=int((datetime.fromisoformat(end).replace(tzinfo=TZ) + timedelta(days=1)).timestamp()),
+                  request_tz=28800,
+                  request_span_days=(datetime.fromisoformat(end).date()
+                                     - datetime.fromisoformat(start_date).date()).days + 1)
         try:
             self._stage('正在建立本次登录的费用接口会话')
-            reader.prepare(self.page)
+            if selected_ids is None:
+                reader.prepare(self.page)
+            else:
+                reader.prepare(self.page, tracking_ids=selected_ids)
             self._stage('正在通过 HTTP 读取指定周期费用')
-            url, payload = reader.read(start_date, end)
-            result['totals'] = parse_cost_response(payload, url, start_date, end)
+            if selected_ids is None:
+                url, payload = reader.read(start_date, end)
+                result['totals'] = parse_cost_response(payload, url, start_date, end)
+            else:
+                url, payload = reader.read(start_date, end, tracking_ids=selected_ids)
+                result['totals'] = parse_cost_response(payload, url, start_date, end,
+                                                      tracking_ids=selected_ids)
+            result['coverage_summary'] = cost_identity_coverage(keys, result['totals'])
+            self._log('cost_identity_coverage', fee_id_source='api_key.tracking_id',
+                      key_id_source='tracking_id_column', **result['coverage_summary'])
             result['source_id'] = sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
             result['reason_code'] = 'OK'
             result['message'] = '已读取所选周期的有效逐 Key 费用；未提供费用记录的 Key 仍保留未知。'
@@ -533,10 +604,13 @@ class BrowserService:
         except CostReadError as exc:
             result['message'] = str(exc)
             result['reason_code'] = exc.reason_code
+            if selected_ids is not None and exc.reason_code == 'NO_USAGE_DATA':
+                result['reason_code'] = 'NO_SELECTED_USAGE_DATA'
+                result['message'] = '指定受管 Key 在所选期间暂无费用明细；不代表绑定错误，费用仍未知。'
             result['retryable'] = exc.retryable
             if exc.reason_code == 'PLATFORM_REJECTED':
                 reader.clear()
-            self._log('cost_collection_rejected', reason_code=exc.reason_code, retryable=exc.retryable,
+            self._log('cost_collection_rejected', reason_code=result['reason_code'], retryable=exc.retryable,
                       message=str(exc), start_date=start_date, end_date=end, **cost_metadata(payload))
         if key_fingerprint(self._keys()) != self.anchor:
             reader.clear()

@@ -1,4 +1,4 @@
-"""Synthetic function-cost candidates do not enable production collection."""
+"""Offline category reports are not real-account acceptance or action permits."""
 from copy import deepcopy
 from datetime import datetime
 from decimal import Decimal
@@ -75,14 +75,13 @@ class OfflineFunctionCostTests(unittest.TestCase):
             self.leaf('0.005', model='synthetic-fetch')]))
         self.assertEqual(candidate.totals, {KEY: Decimal('0.010')})
 
-    def test_production_rejects_same_valid_function_sample_after_offline_parse(self):
+    def test_production_accepts_valid_functions_without_turning_helper_into_permit(self):
         payload = self.report(functions=[self.leaf('0.005')])
-        self.parse(payload)
+        candidate = self.parse(payload)
+        self.assertIs(candidate.production_validated, False)
         for unused in range(2):
-            with self.assertRaises(CostReadError) as caught:
-                production_parse(payload, self.url(payload), START_DATE, START_DATE)
-            self.assertEqual(caught.exception.reason_code, 'CHARGE_TYPE_UNSUPPORTED')
-            self.assertFalse(caught.exception.retryable)
+            self.assertEqual(production_parse(payload, self.url(payload), START_DATE, START_DATE),
+                             {KEY: Decimal('0.005')})
 
     def test_duplicates_within_either_category_are_rejected_across_groups(self):
         for category in ('series', 'function_series'):
@@ -220,6 +219,7 @@ class OfflineFunctionCostTests(unittest.TestCase):
 
     def test_legacy_missing_function_field_keeps_model_only_behavior(self):
         payload = self.report([self.leaf('0.001')])
+        del payload['data']['biz_data']['functions']
         del payload['data']['biz_data']['data'][0]['function_series']
         self.assertEqual(self.parse(payload).totals, {KEY: Decimal('0.001')})
         self.assertEqual(production_parse(payload, self.url(payload), START_DATE, START_DATE),

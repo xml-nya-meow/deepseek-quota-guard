@@ -158,9 +158,23 @@ class HTTPReaderTests(unittest.TestCase):
             {'currency': 'CNY', 'series': [{'api_key': {'tracking_id': 'private-person'},
               'buckets': [{'cost': 'secret-value', 'time': 1}]}], 'function_series': []}
         ]}}}
-        self.assertEqual(cost_metadata(payload), {'response_code': 0, 'biz_code': 0,
+        fields = cost_metadata(payload)
+        expected = {'response_code': 0, 'biz_code': 0,
             'response_start': 1, 'response_end': 2, 'group_count': 1, 'series_count': 1,
-            'bucket_count': 1, 'function_series_count': 0})
+            'bucket_count': 1, 'function_series_count': 0}
+        self.assertEqual({key: fields[key] for key in expected}, expected)
+        self.assertEqual(fields['bucket_kind'], 'missing')
+        self.assertEqual(fields['bucket_first_time'], 1)
+        self.assertEqual(fields['bucket_last_time'], 1)
+        self.assertEqual(fields['function_bucket_count'], 0)
+        self.assertNotIn('function_bucket_first_time', fields)
+        self.assertNotIn('function_bucket_last_time', fields)
+        for prefix in ('response', 'business'):
+            self.assertFalse(fields[prefix + '_message_present'])
+            self.assertEqual(fields[prefix + '_message_type'], 'missing')
+            self.assertEqual(fields[prefix + '_message_length'], 0)
+        for value in ('private-person', 'secret-value'):
+            self.assertNotIn(value, json.dumps(fields))
 
     def test_fixed_endpoint_and_bad_dates(self):
         self.assertTrue(is_cost_endpoint(self.url))

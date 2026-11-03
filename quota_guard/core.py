@@ -6,7 +6,7 @@ costs for the complete configured period, never a delta to add to previous costs
 from __future__ import annotations
 
 from contextlib import closing, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_FLOOR, localcontext
 from hashlib import sha256
@@ -37,6 +37,39 @@ class GuardError(ValueError):
 
 class AccountMismatch(GuardError):
     """The caller may offer a separate ledger, never overwrite this account."""
+
+
+@dataclass(frozen=True)
+class SnapshotApplyResult:
+    """Separate observation, durable ledger state, and subsequent export."""
+    operation_id: str
+    observed_source_id: str
+    effective_snapshot_id: str
+    apply_outcome: str
+    persistence_state: str
+    reason_code: str
+    coverage_summary: dict[str, int]
+    rows: list[dict]
+    export_state: str
+
+    @property
+    def fees_current(self) -> bool:
+        return (self.apply_outcome in {"applied", "current_duplicate"}
+                and bool(self.observed_source_id)
+                and self.observed_source_id == self.effective_snapshot_id)
+
+
+class SnapshotApplyError(GuardError):
+    """Controlled local failure; no raw payload or foreign exception text."""
+    def __init__(self, message, *, reason_code, stage, persistence_state="not_written",
+                 application=None, coverage_summary=None, operation_id=""):
+        super().__init__(message)
+        self.reason_code = reason_code
+        self.stage = stage
+        self.persistence_state = persistence_state
+        self.application = application
+        self.coverage_summary = dict(coverage_summary or {})
+        self.operation_id = operation_id
 
 
 def money(value, *, allow_skip=False) -> Decimal:
@@ -743,57 +776,133 @@ class DataStore:
 
     def apply_snapshot(self, totals: dict[str, Decimal], source_id: str,
                        start_date: str, end_date: str) -> list[dict]:
-        config = self.load()
-        start, end = _date(start_date), _date(end_date)
+        """Compatibility entry point. GUI callers also need the source outcome."""
+        return self.apply_snapshot_result(totals, source_id, start_date, end_date).rows
+
+    def apply_snapshot_result(self, totals: dict[str, Decimal], source_id: str,
+                              start_date: str, end_date: str, *, operation_id="") -> SnapshotApplyResult:
+        coverage = {}
+
+        def rejected(message, code, *, stage="snapshot_validation", state="not_written"):
+            return SnapshotApplyError(message, reason_code=code, stage=stage,
+                                      persistence_state=state, coverage_summary=coverage,
+                                      operation_id=operation_id)
+
+        try:
+            config, people = self.load(), self.read_people()
+        except Exception:
+            raise rejected("无法核验本地账本和人员表；未应用本次费用，请恢复原文件。",
+                           "LOCAL_CONTEXT_UNAVAILABLE", stage="local_context") from None
+        try:
+            start, end = _date(start_date), _date(end_date)
+        except GuardError:
+            raise rejected("账单日期无效，未应用本次费用。", "PERIOD_CONFIG_MISMATCH") from None
         if start != config.start_date or end < start or end > datetime.now(TZ).date().isoformat():
-            raise GuardError("账单时间范围错误，必须从本期起点开始且不晚于今天。")
+            raise rejected("账单时间范围错误，必须从本期起点开始且不晚于今天。", "PERIOD_CONFIG_MISMATCH")
         if not config.account_id:
-            raise GuardError("请先绑定已核实的平台账户及人员 Key。")
-        source = _identifier(source_id)
-        normalized = {_identifier(k): money(v) for k, v in totals.items()}
+            raise rejected("请先绑定已核实的平台账户及人员 Key。", "ACCOUNT_NOT_BOUND")
+        try:
+            source = _identifier(source_id)
+            normalized = {_identifier(k): money(v) for k, v in totals.items()}
+        except (GuardError, AttributeError, TypeError):
+            raise rejected("费用标识或金额无效，未应用本次费用。", "SNAPSHOT_DATA_INVALID") from None
         if len(normalized) != len(totals):
-            raise GuardError("账单存在重复的 Tracking ID，请核对来源。")
+            raise rejected("账单存在重复的 Tracking ID，请核对来源。", "SNAPSHOT_DATA_INVALID")
         digest = sha256(json.dumps({"start": start, "end": end,
             "totals": {k: format(v, "f") for k, v in sorted(normalized.items())}}, sort_keys=True).encode()).hexdigest()
-        people = self.read_people()
-        with self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            existing = db.execute("SELECT digest FROM snapshots WHERE source_id=?", (source,)).fetchone()
-            if existing:
-                if existing[0] != digest:
-                    raise GuardError("相同账单标识对应不同内容，请重新核实来源。")
-            else:
-                previous_end = db.execute("SELECT MAX(end_date) FROM snapshots").fetchone()[0]
-                if previous_end and end < previous_end:
-                    raise GuardError("导入的账单截止日期早于现有统计，拒绝回退。")
-                required = {r[0] for r in db.execute("SELECT tracking_id FROM bindings")}
+        try:
+            with self._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                bindings = list(db.execute("SELECT tracking_id,person,active FROM bindings"))
+                required = {key for key, _, _ in bindings}
+                managed_names = {p.name for p in people if p.name and p.amount >= 0}
+                active_managed = {key for key, name, active in bindings if active and name in managed_names}
+                historical = {key for key, _, active in bindings if not active}
                 received = required.intersection(normalized)
-                if not received:
-                    raise GuardError("账单没有任何已绑定 Key 的可核验费用，未覆盖原统计。")
-                old = {k: Decimal(v) for k, v in db.execute("SELECT tracking_id,amount FROM costs")}
-                for key_id in received:
-                    if key_id in old and normalized[key_id] < old[key_id]:
-                        raise GuardError("累计费用下降，请核对账单修订或日期范围，未覆盖原统计。")
-                for key_id in received:
-                    db.execute("INSERT INTO costs VALUES (?,?,?) ON CONFLICT(tracking_id) DO UPDATE "
-                               "SET amount=excluded.amount, source_id=excluded.source_id",
-                               (key_id, str(normalized[key_id]), source))
-                db.execute("INSERT INTO snapshots VALUES (?,?,?,?,?)", (source, digest, start, end, _now()))
-                self._event(db, "snapshot", {"source_id": source, "start_date": start,
-                    "end_date": end, "tracked_key_count": len(received),
-                    "missing_key_count": len(required - received),
-                    # This versions our audit representation, not a public API contract.
-                    "schema_version": 1, "timezone": "UTC+08:00", "currency": "CNY",
-                    "totals": {key: format(normalized[key], "f") for key in sorted(received)},
-                    "coverage": {"scope": "bound_keys", "complete": required == received,
-                                 "missing_tracking_ids": sorted(required - received),
-                                 "missing_cost": "unknown"}})
-            # Costs and their trigger events commit together. Replaying an old
-            # source still reconciles events against the current workbook.
-            results = self._evaluate(db, config, people)
-            self._record_triggers(db, config, results)
-        self.export_logs()
-        return results
+                coverage.update({
+                    "bound_total_count": len(required), "active_managed_count": len(active_managed),
+                    "fee_tracking_count": len(normalized), "matched_total_count": len(received),
+                    "matched_active_count": len(active_managed.intersection(normalized)),
+                    "matched_historical_count": len(historical.intersection(normalized)),
+                    "active_missing_count": len(active_managed.difference(normalized)),
+                })
+                existing = db.execute("SELECT digest FROM snapshots WHERE source_id=?", (source,)).fetchone()
+                latest = db.execute("SELECT source_id FROM snapshots ORDER BY rowid DESC LIMIT 1").fetchone()
+                effective = latest[0] if latest else ""
+                if existing:
+                    if existing[0] != digest:
+                        raise rejected("相同账单标识对应不同内容，请重新核实来源。", "SNAPSHOT_CONFLICT")
+                    outcome = "current_duplicate" if source == effective else "stale_replay"
+                else:
+                    previous_end = db.execute("SELECT MAX(end_date) FROM snapshots").fetchone()[0]
+                    if previous_end and end < previous_end:
+                        raise rejected("导入的账单截止日期早于现有统计，拒绝回退。", "END_DATE_REGRESSION")
+                    if not required:
+                        raise rejected("费用已读取，但当前账本没有已绑定 Key；请先核对受管人员，未应用本次费用。",
+                                       "NO_MANAGED_BINDINGS")
+                    if not received:
+                        raise rejected("费用已读取，但没有匹配此账本绑定的 Key；原累计保留，请核对 Key 绑定。",
+                                       "NO_BOUND_COST_MATCH")
+                    old = {k: Decimal(v) for k, v in db.execute("SELECT tracking_id,amount FROM costs")}
+                    if any(key in old and normalized[key] < old[key] for key in received):
+                        raise rejected("累计费用下降，请核对账单修订或日期范围，未覆盖原统计。", "CUMULATIVE_DECREASE")
+                    for key_id in received:
+                        db.execute("INSERT INTO costs VALUES (?,?,?) ON CONFLICT(tracking_id) DO UPDATE "
+                                    "SET amount=excluded.amount, source_id=excluded.source_id",
+                                    (key_id, str(normalized[key_id]), source))
+                    db.execute("INSERT INTO snapshots VALUES (?,?,?,?,?)", (source, digest, start, end, _now()))
+                    self._event(db, "snapshot", {"source_id": source, "start_date": start,
+                        "end_date": end, "tracked_key_count": len(received),
+                        "missing_key_count": len(required - received),
+                        "schema_version": 1, "timezone": "UTC+08:00", "currency": "CNY",
+                        "totals": {key: format(normalized[key], "f") for key in sorted(received)},
+                        "coverage": {"scope": "bound_keys", "complete": required == received,
+                                     "missing_tracking_ids": sorted(required - received),
+                                     "missing_cost": "unknown"}})
+                    outcome, effective = "applied", source
+                results = self._evaluate(db, config, people)
+                # An old observation cannot authorize or create new trigger evidence.
+                if outcome != "stale_replay":
+                    self._record_triggers(db, config, results)
+        except SnapshotApplyError:
+            raise
+        except Exception:
+            # Do not infer rollback merely from a missing diagnostic event. Even
+            # a commit/connection failure must be reconciled against the database.
+            raise rejected("费用保存结果待核实；请恢复本地账本，核实前保持自动管理停止。",
+                           "SNAPSHOT_PERSISTENCE_UNKNOWN", stage="snapshot_transaction", state="unknown") from None
+        application = SnapshotApplyResult(
+            operation_id, source, effective, outcome, "persisted",
+            "STALE_SNAPSHOT_REPLAY" if outcome == "stale_replay" else "OK",
+            dict(coverage), results, "pending")
+        # Only successful exit from the SQLite transaction establishes persistence.
+        try:
+            self.export_logs()
+        except Exception:
+            raise SnapshotApplyError("费用和事件已保存在统计库，但日志导出未完成；请恢复目录写入后保存处理记录。",
+                                     reason_code="AUDIT_EXPORT_FAILED", stage="audit_export",
+                                     persistence_state="persisted", application=application,
+                                     coverage_summary=coverage, operation_id=operation_id) from None
+        return replace(application, export_state="complete")
+
+    def current_snapshot_id(self) -> str:
+        """Query identity only, without evaluation, events, or exports."""
+        try:
+            with closing(sqlite3.connect(self.db_path.as_uri() + "?mode=ro", uri=True, timeout=10)) as db:
+                row = db.execute("SELECT source_id FROM snapshots ORDER BY rowid DESC LIMIT 1").fetchone()
+                return row[0] if row else ""
+        except sqlite3.Error:
+            raise GuardError("无法只读核验当前费用快照，请检查统计库。") from None
+
+    def read_evaluation(self) -> list[dict]:
+        """Read current rows for recovery; never reconcile triggers or export."""
+        config, people = self.load(), self.read_people()
+        try:
+            with closing(sqlite3.connect(self.db_path.as_uri() + "?mode=ro", uri=True, timeout=10)) as db:
+                db.execute("BEGIN")
+                return self._evaluate(db, config, people)
+        except sqlite3.Error:
+            raise GuardError("无法只读恢复人员状态，请检查统计库。") from None
 
     def evaluate(self) -> list[dict]:
         """Evaluate current rules and idempotently reconcile their audit events.

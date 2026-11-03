@@ -206,6 +206,27 @@ _HEADER_ENUMS = {
 }
 _HEADER_COUNTER_LIMITS = {'value_length': 1025, 'matched_request_count': 10000}
 _HEADER_BOOLEANS = frozenset({'bearer_format_passed'})
+_COST_ENUMS = {
+    'scope_kind': frozenset({'managed_keys'}),
+    'fee_id_source': frozenset({'api_key.tracking_id'}),
+    'key_id_source': frozenset({'tracking_id_column'}),
+    'bucket_kind': frozenset({'integer', 'text', 'missing', 'unsupported'}),
+    'response_message_type': frozenset({'missing', 'null', 'str', 'bool', 'int', 'float',
+                                        'dict', 'list', 'decimal', 'other', 'mixed'}),
+    'business_message_type': frozenset({'missing', 'null', 'str', 'bool', 'int', 'float',
+                                        'dict', 'list', 'decimal', 'other', 'mixed'}),
+}
+_COST_COUNTER_LIMITS = {
+    'response_message_length': 1024, 'business_message_length': 1024,
+    'request_span_days': 3652059,
+    'bucket_first_time': 253402300799, 'bucket_last_time': 253402300799,
+    'function_bucket_first_time': 253402300799, 'function_bucket_last_time': 253402300799,
+    'function_bucket_count': 1000000,
+    **dict.fromkeys(('platform_key_count', 'matched_platform_count', 'unmatched_fee_count',
+                    'missing_platform_count', 'uuid_casefold_match_count', 'case_only_match_count'),
+                   1000000),
+}
+_COST_BOOLEANS = frozenset({'response_message_present', 'business_message_present'})
 _SCALARS = {
     'stage', 'action', 'status', 'reason', 'error_type', 'error_code', 'message',
     'generation', 'session', 'task_id', 'action_id', 'pid', 'worker_pid', 'parent_pid',
@@ -218,6 +239,11 @@ _SCALARS = {
     'reason_code', 'request_start', 'request_end', 'response_start', 'response_end',
     'group_count', 'series_count', 'bucket_count', 'function_series_count',
     'source_id', 'response_code', 'biz_code', 'operation_id', 'click_completed', 'channel', 'phase',
+    'app_version', 'build_commit', 'build_id', 'diagnostic_schema_version',
+    'persistence_state', 'export_state', 'apply_outcome', 'observed_source_id', 'effective_snapshot_id',
+    'observed_source_is_effective', 'source_seen_before', 'payload_digest_matches',
+    'bound_total_count', 'active_managed_count', 'fee_tracking_count', 'matched_total_count',
+    'matched_active_count', 'matched_historical_count', 'active_missing_count', 'decrease_count',
 }
 
 
@@ -253,7 +279,22 @@ def safe_fields(fields):
     result = {}
     for key, value in fields.items():
         key = str(key)
-        if key in _HEADER_ENUMS:
+        if key in _COST_ENUMS:
+            if type(value) is str and value in _COST_ENUMS[key]:
+                result[key] = value
+        elif key in _COST_COUNTER_LIMITS:
+            if type(value) is int and value >= 0:
+                result[key] = min(value, _COST_COUNTER_LIMITS[key])
+        elif key in _COST_BOOLEANS:
+            if type(value) is bool:
+                result[key] = value
+        elif key == 'request_tz':
+            if type(value) is int and value == 28800:
+                result[key] = value
+        elif key == 'bucket_seconds':
+            if type(value) is int and value in (3600, 86400):
+                result[key] = value
+        elif key in _HEADER_ENUMS:
             if type(value) is str and value in _HEADER_ENUMS[key]:
                 result[key] = value
         elif key in _HEADER_COUNTER_LIMITS:

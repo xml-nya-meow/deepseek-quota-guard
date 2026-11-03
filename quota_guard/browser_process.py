@@ -12,6 +12,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 import multiprocessing
 import os
+import re
 from pathlib import Path
 from queue import Empty, Queue
 import signal
@@ -27,6 +28,11 @@ from .target_lock import validate_lock_names
 from .profile_recovery import (WindowsLifetime, job_name, ownership, plain_directory,
                                read_marker, recover_profiles, remove_profile_tree,
                                witness_main, write_marker)
+
+
+def _operation_fields(task):
+    value = task.kwargs.get('operation_id') if task and task.action == 'collect' else None
+    return {'operation_id': value} if isinstance(value, str) and re.fullmatch('[0-9a-f]{32}', value) else {}
 
 
 _TIMEOUTS = {'login': 45, 'collect': 90, 'read_keys': 45, 'prepare_revoke': 45,
@@ -428,6 +434,7 @@ class IsolatedBrowserService:
                 context = {'pid': os.getpid(), 'worker_pid': self._worker_pid,
                            'generation': self._generation, 'session': self._session,
                            'action': task.action if task else None, 'task_id': task.number if task else None}
+                context.update(_operation_fields(task))
                 self._logger.emit(event, **{**context, **fields})
             except Exception:
                 pass
@@ -812,7 +819,8 @@ class IsolatedBrowserService:
             if active is not None and active.permit is not None:
                 active.permit.decide(False)
         log_context = {'session': self._session, 'worker_pid': self._worker_pid,
-                       'action': active.action if active else None, 'task_id': active.number if active else None}
+                       'action': active.action if active else None, 'task_id': active.number if active else None,
+                       **_operation_fields(active)}
         cleanup_error = None
         try:
             self._kill_session()
@@ -968,7 +976,7 @@ class IsolatedBrowserService:
                 self._abort('平台操作超时，迟到结果未用于更新当前状态')
                 return
             self._log('browser_action_finished', action=task.action, task_id=task.number,
-                      success=task.future.exception() is None)
+                      success=task.future.exception() is None, **_operation_fields(task))
 
     def _monitor(self):
         try:

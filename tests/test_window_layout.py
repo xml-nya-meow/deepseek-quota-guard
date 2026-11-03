@@ -72,8 +72,15 @@ class WindowLayoutTests(unittest.TestCase):
         self.assertEqual(self.root.resizable(), (1, 1))
         self.assertGreater(area.content.winfo_height(), area.canvas.winfo_height())
         small_height = app.tree.winfo_height()
-        self.root.geometry('1600x1400')
+        # Hosted desktops can cap Toplevel geometry at their screen size.
+        # This hidden test must actually supply surplus viewport space before
+        # checking expansion; asking for 1600x1400 alone does not guarantee it.
+        large_width = max(1600, area.content.winfo_reqwidth() + 200)
+        large_height = max(1400, area.content.winfo_reqheight() + 300)
+        self.root.maxsize(large_width, large_height)
+        self.root.geometry(f'{large_width}x{large_height}')
         self.settle()
+        self.assertGreater(area.canvas.winfo_height(), area.content.winfo_reqheight())
         self.assertGreater(app.tree.winfo_height(), small_height)
 
     def test_new_list_has_fixed_footer_and_expanding_inputs(self):
