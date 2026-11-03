@@ -154,7 +154,7 @@ dev8 排查曾发现 Playwright 初始化所需的 Python 本机通信阻塞，P
 | dev9 零额度首轮自动撤销 | **同一轮连续三枚真实成功**；当时费用为 `NO_USAGE_DATA`，仅证明零额度规则与首轮自动执行，不证明正额度或周期读取 |
 | dev10 强制删除后启动管理 | 已改为重新读取后进入原启动确认；离线结果见 dev10 历史记录，**真实衔接尚待复测** |
 | dev11–dev14 历史费用应用与诊断 | 已区分采集、账本提交、导出/刷新；新日志确认一次历史费用 `NO_BOUND_COST_MATCH`、长区间业务拒绝及当日空明细，前两者的具体归属或平台原因仍待核实 |
-| GitHub 托管 CI | dev16 待同版源码推送后核查。历史 dev15 运行代码提交 `3225492` 的 [Windows CI](https://github.com/xml-nya-meow/deepseek-quota-guard/actions/runs/41588854153) 为 **878 项通过、0 跳过，620.033 秒**；历史结果不能替代本版 CI。旧 dev10 的布局断言前提已修正且未跳过断言。 |
+| GitHub 托管 CI | dev16 运行代码提交 `b0d1f8d` 的 [Windows CI](https://github.com/xml-nya-meow/deepseek-quota-guard/actions/runs/41595981076) 已通过：**894 项通过、0 跳过，423.208 秒**。本次远端便携构建任务未运行，本地 Windows 构建与成品结果另列。历史 dev15 的 878 项及旧布局断言修正保留在历史记录。 |
 | 浏览器启动诊断 | 保留限时本机通信检查、明确阶段和登录失败提示；dev9 实际回环探针已成功，完整浏览器与成品结果见本轮记录，旧 `10051` 原因未确定 |
 | 自动保存、撤销与内置日志 | 继承 dev9；编辑实盘、错误保护、按钮布局及日志脱敏/保留/预览限制纳入离线验收，具体结果见本轮记录 |
 | 正额度真实消费 → 周期读取 → 自动撤销 | **关键未测**：大于 0 的斩杀线生成个人额度后，真实消费跨过该值的完整闭环尚未验证；已有离线规则与调度测试 |
@@ -258,7 +258,7 @@ $env:PLAYWRIGHT_BROWSERS_PATH = Join-Path $PWD 'browser-runtime'
 
 推送和 pull request 会运行 Windows 单元测试。通过 GitHub Actions 的手动运行入口勾选 `build_portable` 后，额外下载 Chromium、构建便携目录，并执行界面启动及 `about:blank` 浏览器检查。检查使用独立临时数据目录，不登录 DeepSeek、不读取真实账单、不调用付费接口。
 
-dev16 本地 894 项完整回归及 Windows 成品检查已通过；本版托管 CI 待推送后核查，不能借用以下历史结果。具体状态见 [dev16 记录](docs/dev16-reliability-20261103.md)。
+dev16 本地 894 项完整回归及 Windows 成品检查已通过；运行代码提交 `b0d1f8d` 的 [本版托管 CI](https://github.com/xml-nya-meow/deepseek-quota-guard/actions/runs/41595981076) 也已通过 **894 项、0 跳过，423.208 秒**。末尾提交仅补充文档结果，未修改运行代码或测试；没有运行远端便携构建任务或创建二进制 Release。具体证据见 [dev16 记录](docs/dev16-reliability-20261103.md)，以下保留 dev15 历史过程。
 
 手动构建生成 ZIP 及 SHA-256 校验文件，作为 workflow artifact 保存；流程不会自动创建 Release。浏览器启动检查仅验证打包完整性，不能证明网页适配或真实撤销成功。
 
