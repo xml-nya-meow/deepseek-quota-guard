@@ -66,7 +66,7 @@ class CollectionDiagnosticTests(unittest.TestCase):
                     result = diagnostic_build_identity()
                     self.assertEqual(result['build_id'], 'unverified')
                 path.write_text(json.dumps(valid), encoding='utf-8')
-                self.assertEqual(diagnostic_build_identity(), {**valid, 'diagnostic_schema_version': 2})
+                self.assertEqual(diagnostic_build_identity(), {**valid, 'diagnostic_schema_version': 3})
 
     def test_operation_id_joins_worker_and_controller_diagnostics(self):
         operation = 'a' * 32

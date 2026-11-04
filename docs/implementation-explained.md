@@ -39,7 +39,7 @@ flowchart LR
 | 斩杀线 | 新表默认个人额度，可选预填 `-1` 或斩杀线，最小 0；已有人员的额度不被默认值改写 | [preferences.py](../quota_guard/preferences.py)、表格初始化流程 |
 | 全自动管理 | 用户开启一次后，程序按本地判断处理目标，不逐枚询问；每轮处理结束再等待设定间隔，默认 10 秒。读取过期、跨日、配置变化等会重新核验 | `App.start()`、`App._process_next()`、轮询调度 |
 | 强制删除 | 用户明确选中目标并确认意图后，跳过“必须达额”的条件；仍要核验账户、目标、未决操作和单次提交资格 | `App.revoke_selected_once()` 及 `App._execute_revoke()` |
-| 平台撤销 | 正式入口通过管理 HTTP 接口提交一次。名称、Tracking ID、掩码及创建时间用于目标核验；不会因 HTTP 失败自动改用网页垃圾桶重试 | [platform_keys.py](../quota_guard/platform_keys.py)、`BrowserService._revoke()` |
+| 平台撤销 | 用完整 Tracking ID 对照 HTTP 与网页的全量身份。对已绑定的 `NORMAL` 目标核对名称、掩码和创建时间，通过单次许可后才提交。登录 Harness 产生的 `DSH` 项参与身份核验，普通删除入口会拒绝它。列表可重新排序 | [platform_keys.py](../quota_guard/platform_keys.py)、`BrowserService._revoke()` |
 | 删除结果确认 | 提交前先保存处理记录并授予短期一次性许可；提交后再 GET Key 列表，与重新加载网页交叉核验。结果未知时保存待核实状态，禁止盲目重发 | [revocation_permit.py](../quota_guard/revocation_permit.py)、账本事件 |
 | 新建列表与编辑 | 可延续人员/个人额度，或新建空白名单；旧账本保留。有效编辑自动写盘，支持撤销和放弃本轮修改；取消关闭保留已保存内容 | [people_editor.py](../quota_guard/people_editor.py)、[people_editor_ui.py](../quota_guard/people_editor_ui.py)、[workspace.py](../quota_guard/workspace.py) |
 | Excel 导入 | 验证表头、数值、重名及公式结果，转换成相同的人员模型。合成工作簿测试与真实 Excel/WPS 操作验收分开记录 | [excel_io.py](../quota_guard/excel_io.py) |

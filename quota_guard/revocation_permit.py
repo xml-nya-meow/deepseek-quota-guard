@@ -18,6 +18,9 @@ MAX_GRANT_SECONDS = 5.0
 _CLOCK_FIELDS = ('issued_monotonic', 'expires_monotonic', 'issued_wall', 'expires_wall')
 
 KEY_READ_REASONS = {
+    'KEY_KIND_INVALID': 'Key HTTP 列表包含尚未适配的 Key 类型，无法完成列表核验。',
+    'KEY_TARGET_KIND_UNSUPPORTED': '完整身份列表已核对，但所选 Key 的删除类型尚未适配；未执行删除。请提供本次诊断日志用于适配。',
+    'KEY_TARGET_NOT_DELETABLE': '所选 Key 由 Harness 管理，平台不提供普通 Key 删除操作；未执行删除。',
     'KEY_HTTP_AUTH_REQUIRED': 'Key HTTP 请求授权失效或被拒绝，请重新核验登录。',
     'KEY_HTTP_REDIRECTED': 'Key HTTP 请求被重定向或返回地址不符。',
     'KEY_HTTP_FAILED': 'Key HTTP 请求未返回成功状态，请核验网络与平台状态。',

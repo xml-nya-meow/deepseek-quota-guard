@@ -23,7 +23,7 @@ from uuid import uuid4
 from . import __version__
 from .core import AccountMismatch, DataStore, GuardError, Person, SnapshotApplyError, clean_name, money
 from .build_identity import diagnostic_build_identity
-from .revocation_permit import RevocationNotSubmitted
+from .revocation_permit import KeyInspectionError, RevocationNotSubmitted
 from .target_lock import TargetLockError
 from .workspace import new_ledger_path, save_current_ledger
 from .preferences import (DEFAULT_POLL_INTERVAL_SECONDS, load_poll_interval,
@@ -38,6 +38,12 @@ from .window_layout import ScrollableContent, fit_window
 TZ = timezone(timedelta(hours=8))
 POLL_MS = DEFAULT_POLL_INTERVAL_SECONDS * 1000
 COLLECTION_MAX_AGE_SECONDS = 300
+MANAGEMENT_CONTRACT_REASONS = frozenset({
+    'KEY_KIND_INVALID', 'KEY_TARGET_KIND_UNSUPPORTED', 'KEY_TARGET_NOT_DELETABLE',
+    'KEY_REDACTED_ID_INVALID', 'KEY_CREATED_AT_INVALID', 'KEY_NAME_INVALID',
+    'KEY_TRACKING_ID_INVALID', 'KEY_LIST_IDENTITY_MISMATCH',
+    'KEY_LIST_DUPLICATE_IDENTITY', 'KEY_LIST_SCHEMA_INVALID',
+})
 FEE_STATE_LABELS = {
     "NO_USAGE_DATA": "暂无明细，费用未知", "AUTH_REQUIRED": "需重新登录",
     "NO_SELECTED_USAGE_DATA": "受管 Key 暂无明细",
@@ -660,6 +666,22 @@ class App:
         if variable is not None:
             variable.set(text)
 
+    def _saved_fee_fact(self):
+        """A historical UI fact only; never grants or refreshes permission."""
+        fact = getattr(self, 'last_saved_fee_fact', None)
+        if not fact or self.store is None:
+            return ''
+        try:
+            config = self.store.load()
+            if (fact['folder'] != self.folder or fact['period_id'] != config.period_id
+                    or fact['source_id'] != self.store.current_snapshot_id()):
+                return ''
+        except Exception:
+            return ''
+        when = datetime.fromtimestamp(fact['observed_wall'], TZ).strftime('%m-%d %H:%M:%S')
+        return (f"最近费用已保存：{fact['start_date']} 至 {fact['end_date']}，"
+                f"读取于 {when}（UTC+8）。")
+
     @staticmethod
     def _coverage_text(summary):
         """Display only anonymous counts; this text never grants authority."""
@@ -707,6 +729,10 @@ class App:
         self.collection_observed_monotonic = observed_monotonic
         self.collection_source_id = source
         self.collection_has_fees = application is not None
+        if application is not None:
+            self.last_saved_fee_fact = dict(folder=self.folder, period_id=context[2],
+                source_id=source, start_date=context[4], end_date=end_date,
+                observed_wall=observed_wall)
 
     def _collection_is_current(self):
         return (self.collection_context is not None
@@ -1253,6 +1279,13 @@ class App:
             self.stop(quiet=True)
             self._invalidate_collection(session=True)
             self.last_keys = []
+            if (action in {'inspect_revoke', 'revoke'}
+                    and isinstance(exc, (KeyInspectionError, RevocationNotSubmitted))
+                    and exc.reason_code in MANAGEMENT_CONTRACT_REASONS):
+                self._show_collection_summary(
+                    self._saved_fee_fact() + '管理准备核验未通过，自动管理已停止；'
+                    '已保存记录保留，当前删除资格已失效。此错误不等于平台已退出登录；'
+                    '修正原因后可直接重新读取费用进行核验。')
             self._diagnostic("browser_action_failed", action=action, error_type=type(exc).__name__,
                              operation_id=diagnostic_operation_id)
             self._action_state(button_key, "失败")

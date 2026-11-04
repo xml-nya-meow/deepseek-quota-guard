@@ -482,7 +482,9 @@ class BrowserService:
         snapshot = self.page.evaluate(_KEY_TABLE_JS)
         keys = parse_key_table(snapshot)
         previous = getattr(self, '_last_key_snapshot', None)
-        if previous is None or keys != parse_key_table(previous):
+        # The table may have been sorted again. Verify the complete identity
+        # set, then locate and recheck the actual row in the current snapshot.
+        if previous is None or key_fingerprint(keys) != key_fingerprint(parse_key_table(previous)):
             raise GuardError('定位期间 Key 列表发生变化，已停止。')
         matches = [index for index, key in enumerate(keys) if key == {'name': name, 'tracking_id': tracking_id}]
         if len(matches) != 1:

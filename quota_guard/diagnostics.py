@@ -204,10 +204,14 @@ _HEADER_ENUMS = {
     'value_type': frozenset({'str', 'bool', 'int', 'float', 'bytes', 'list', 'tuple', 'dict', 'none', 'other'}),
     'source_kind': frozenset({'key_list', 'cost_read'}),
 }
-_HEADER_COUNTER_LIMITS = {'value_length': 1025, 'matched_request_count': 10000}
-_HEADER_BOOLEANS = frozenset({'bearer_format_passed'})
+_HEADER_COUNTER_LIMITS = {'value_length': 1025, 'matched_request_count': 10000,
+                          'http_row_ordinal': 1000}
+_HEADER_BOOLEANS = frozenset({'bearer_format_passed', 'is_selected_target',
+                              'dom_identity_matched', 'redacted_format_valid', 'created_at_valid'})
 _KEY_ENUMS = {
-    'key_field': frozenset({'name', 'tracking_id', 'sensitive_id', 'created_at'}),
+    'key_field': frozenset({'name', 'tracking_id', 'sensitive_id', 'created_at', 'key_type'}),
+    # USER remains readable in historical diagnostic records only.
+    'key_kind': frozenset({'NORMAL', 'DSH', 'unknown', 'USER'}),
 }
 _COST_ENUMS = {
     'scope_kind': frozenset({'managed_keys'}),

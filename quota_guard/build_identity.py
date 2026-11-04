@@ -8,7 +8,7 @@ import sys
 
 from . import __version__
 
-DIAGNOSTIC_SCHEMA_VERSION = 2
+DIAGNOSTIC_SCHEMA_VERSION = 3
 
 
 def source_build_identity(root):

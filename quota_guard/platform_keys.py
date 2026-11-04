@@ -40,6 +40,7 @@ EMPTY_HEADER_NAMES = frozenset({'x-device-model'})
 MAX_CLIENT_HEADER_LENGTH = 1024
 _TRACKING = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
 _REDACTED = re.compile(r'sk-[A-Za-z0-9]+\*+[A-Za-z0-9]+')
+_DSH_DISPLAY = re.compile(r'DeepSeek Harness(?: *App-managed)?')
 _PREPARATION_MESSAGES = {
     'KEY_SESSION_MISMATCH': '管理授权必须来自本程序当前独立浏览器。',
     'KEY_PAGE_CHANGED': '平台登录已失效或离开预期页面，请重新登录。',
@@ -77,6 +78,39 @@ class DeleteTarget:
     name: str
     sensitive_id: str = field(repr=False)
     created_at: int
+
+
+@dataclass(frozen=True, repr=False)
+class IdentityEntry:
+    """A complete-list identity, not permission to manage this object.
+
+    Rows exist only during this read. Only a verified ordinary target supplies
+    delete parameters. Other entries still contribute to the identity check.
+    """
+    tracking_id: str
+    name: str
+    kind: str
+    row: dict = field(repr=False, compare=False)
+    ordinal: int
+
+
+def _key_kind(value):
+    kind = value.get('key_type') if isinstance(value, dict) else None
+    # Console list observed 2026-11-04: NORMAL is ordinary, DSH is managed
+    # by Harness. New values can establish identity without granting an action.
+    return kind if isinstance(kind, str) and kind in ('NORMAL', 'DSH') else 'unknown'
+
+
+def _listed_identity(value, ordinal):
+    kind = _key_kind(value)
+    if kind == 'DSH':
+        # The official mapper replaces the raw name for DSH. Its secret column
+        # is unavailable, and its edit/delete buttons are disabled. Never
+        # manufacture a redacted secret or creation time for such a row.
+        name, tracking_id = _identity({'name': 'DeepSeek Harness', 'tracking_id': value.get('tracking_id')})
+    else:
+        name, tracking_id = _identity(value)
+    return IdentityEntry(tracking_id, name, kind, value, ordinal)
 
 
 def _valid_name(value):
@@ -124,6 +158,8 @@ class ConsoleKeyManager:
         self._emit = emit or (lambda *_args, **_kwargs: None)
         self._headers = {}
         self._issued = None
+        self._prepared_types = None
+        self._app_managed_names = {}
         self._attempted = set()
         self.failure_reason = None
         self._bootstrap_source = None
@@ -136,6 +172,8 @@ class ConsoleKeyManager:
     def clear(self):
         self._headers.clear()
         self._issued = None
+        self._prepared_types = None
+        self._app_managed_names.clear()
         self._attempted.clear()
         self.failure_reason = None
         self._bootstrap_source = None
@@ -148,6 +186,8 @@ class ConsoleKeyManager:
         self._headers.clear()
         self._issued = None
         self._requests.clear()
+        self._prepared_types = None
+        self._app_managed_names.clear()
         self._matched_count = 0
         self._observation_reason = None
         self.failure_reason = error.reason_code
@@ -167,6 +207,8 @@ class ConsoleKeyManager:
         if not self._capture_depth:
             self._headers.clear()
             self._issued = None
+            self._prepared_types = None
+            self._app_managed_names.clear()
             self.failure_reason = None
             self._bootstrap_source = 'key_list'
             self._requests.clear()
@@ -187,6 +229,8 @@ class ConsoleKeyManager:
             if not completed:
                 self._headers.clear()
                 self._issued = None
+                self._prepared_types = None
+                self._app_managed_names.clear()
                 self._requests.clear()
                 self._matched_count = 0
                 self._observation_reason = None
@@ -229,6 +273,8 @@ class ConsoleKeyManager:
         # mutations stay consumed across this invalidation.
         self._headers.clear()
         self._issued = None
+        self._prepared_types = None
+        self._app_managed_names.clear()
         try:
             bearer = request.header_value('authorization')
             if bearer is None:
@@ -430,59 +476,119 @@ class ConsoleKeyManager:
             except Exception:
                 pass
 
-    def _read_targets(self):
+    def _read_rejected(self, reason, *, entry=None, row=None, ordinal=0, selected_id=None):
+        field_name = {'KEY_NAME_INVALID': 'name', 'KEY_TRACKING_ID_INVALID': 'tracking_id',
+                      'KEY_REDACTED_ID_INVALID': 'sensitive_id',
+                      'KEY_CREATED_AT_INVALID': 'created_at',
+                      'KEY_TARGET_KIND_UNSUPPORTED': 'key_type'}.get(reason)
+        if entry is not None:
+            row, ordinal = entry.row, entry.ordinal
+        metadata = {}
+        if field_name and ordinal:
+            value = row.get(field_name) if isinstance(row, dict) else row
+            kind = type(value).__name__
+            metadata = {'key_field': field_name,
+                        'field_present': isinstance(row, dict) and field_name in row,
+                        'value_type': ('none' if value is None else kind
+                                       if kind in {'str', 'bool', 'int', 'float', 'list', 'dict'} else 'other'),
+                        'key_kind': _key_kind(row)}
+            if isinstance(value, str):
+                metadata['value_length'] = min(len(value), 1025)
+        if selected_id is not None and isinstance(row, dict):
+            metadata['is_selected_target'] = row.get('tracking_id') == selected_id
+        # count remains the legacy 1-based response ordinal, not the list size.
+        self._report('key_http_read_rejected', reason_code=reason,
+                     count=ordinal, http_row_ordinal=ordinal, **metadata)
+
+    def _read_inventory(self, *, selected_id=None):
         options, response = self._options(), None
-        row_index = None
+        row, ordinal = None, 0
         try:
             response = self._context.request.get(LIST_URL, **options)
             data = self._payload(response, LIST_URL)
             rows = data.get('api_keys') if isinstance(data, dict) else None
             if not isinstance(rows, list) or len(rows) > 1000:
                 raise KeyReadError('KEY_LIST_SCHEMA_INVALID')
-            targets = []
-            for row_index, row in enumerate(rows):
-                targets.append(_target(row))
-            row_index = None
-            if (len({item.tracking_id.lower() for item in targets}) != len(targets)
-                    or len({item.sensitive_id for item in targets}) != len(targets)):
+            entries = []
+            for ordinal, row in enumerate(rows, 1):
+                entries.append(_listed_identity(row, ordinal))
+            ordinal = 0
+            if len({item.tracking_id.lower() for item in entries}) != len(entries):
                 raise KeyReadError('KEY_LIST_DUPLICATE_IDENTITY')
-            return targets
+            self._report('key_http_identity_list_parsed', key_count=len(entries),
+                         count=sum(item.kind == 'unknown' for item in entries))
+            return entries
         except KeyReadError as exc:
-            metadata = {}
-            field_name = {'KEY_NAME_INVALID': 'name', 'KEY_TRACKING_ID_INVALID': 'tracking_id',
-                          'KEY_REDACTED_ID_INVALID': 'sensitive_id',
-                          'KEY_CREATED_AT_INVALID': 'created_at'}.get(exc.reason_code)
-            if row_index is not None and field_name:
-                present = isinstance(row, dict) and field_name in row
-                value = row.get(field_name) if isinstance(row, dict) else row
-                kind = type(value).__name__
-                metadata = {'key_field': field_name, 'field_present': present,
-                            'value_type': ('none' if value is None else kind
-                                           if kind in {'str', 'bool', 'int', 'float', 'list', 'dict'} else 'other')}
-                if isinstance(value, str):
-                    metadata['value_length'] = min(len(value), 1025)
-            self._report('key_http_read_rejected', reason_code=exc.reason_code,
-                         count=row_index + 1 if row_index is not None else 0, **metadata)
+            self._read_rejected(exc.reason_code, row=row, ordinal=ordinal, selected_id=selected_id)
             raise
         except GuardError:
             raise
         except Exception:
-            self._report('key_http_read_rejected', reason_code='KEY_LIST_TRANSPORT_FAILED')
+            self._read_rejected('KEY_LIST_TRANSPORT_FAILED')
             raise KeyReadError('KEY_LIST_TRANSPORT_FAILED') from None
         finally:
             self._dispose(response)
 
     def read_keys(self):
-        """Read a fresh full list, including after submission; issue no permit.
+        """Read identities, including after a submission; never issue a target.
 
-        The caller compares this result with a separately refreshed DOM list.
-        Neither an empty result alone nor a prior POST proves a deletion.
+        Surviving entries need identities, not delete parameters. The caller
+        separately reloads the DOM and checks absence and account continuity.
         """
-        return [{'name': item.name, 'tracking_id': item.tracking_id}
-                for item in self._read_targets()]
+        self._issued = None
+        result = []
+        try:
+            for item in self._read_inventory():
+                if self._prepared_types is not None:
+                    previous = self._prepared_types.get(item.tracking_id)
+                    # A changed display mapping cannot inherit a verified name.
+                    # Other kinds are opaque identity anchors, not permissions.
+                    if ((previous is not None and (previous == 'DSH') != (item.kind == 'DSH'))
+                            or (item.kind == 'DSH' and previous != 'DSH')):
+                        raise KeyReadError('KEY_LIST_IDENTITY_MISMATCH')
+                name = (self._app_managed_names.get(item.tracking_id, item.name)
+                        if item.kind == 'DSH' else item.name)
+                result.append({'name': name, 'tracking_id': item.tracking_id})
+        except Exception:
+            self._prepared_types = None
+            self._app_managed_names.clear()
+            raise
+        return result
+
+    def _report_entry_shapes(self, entries, expected_names, selected_id):
+        # Full IDs are compared only in memory. Ordinals are local aliases for
+        # this observation, never identity joins. Cap routine diagnostics even
+        # for an account with many unknown bystanders; always include target.
+        reported = 0
+        for item in entries:
+            selected = item.tracking_id == selected_id
+            if not selected and (item.kind != 'unknown' or reported >= 20):
+                continue
+            row = item.row
+            kind_value = row.get('key_type')
+            sensitive = row.get('sensitive_id')
+            created = row.get('created_at')
+            display = expected_names.get(item.tracking_id)
+            dom_matches = (bool(isinstance(display, str) and _DSH_DISPLAY.fullmatch(display))
+                           if item.kind == 'DSH' else display == item.name)
+            value_type = type(kind_value).__name__
+            self._report('key_http_entry_shape', http_row_ordinal=item.ordinal,
+                         key_count=len(entries), is_selected_target=selected,
+                         dom_identity_matched=dom_matches, key_kind=item.kind,
+                         field_present='key_type' in row, key_field='key_type',
+                         value_type=('none' if kind_value is None else value_type
+                                     if value_type in {'str', 'bool', 'int', 'float', 'list', 'dict'} else 'other'),
+                         value_length=min(len(kind_value), 1025) if isinstance(kind_value, str) else 0,
+                         redacted_format_valid=(isinstance(sensitive, str) and len(sensitive) <= 160
+                                                and bool(_REDACTED.fullmatch(sensitive))),
+                         created_at_valid=(type(created) is int and 0 < created <= 253402300799))
+            if not selected:
+                reported += 1
 
     def read_target(self, name, tracking_id, expected_keys):
         self._issued = None
+        self._prepared_types = None
+        self._app_managed_names.clear()
         requested = _identity({'name': name, 'tracking_id': tracking_id})
         if not isinstance(expected_keys, (list, tuple)) or not expected_keys:
             raise KeyReadError('KEY_EXPECTED_LIST_INVALID')
@@ -491,15 +597,44 @@ class ConsoleKeyManager:
             raise KeyReadError('KEY_EXPECTED_LIST_INVALID')
         if tracking_id in self._attempted:
             raise KeyReadError('KEY_TARGET_ALREADY_ATTEMPTED')
-        targets = self._read_targets()
-        if {(item.name, item.tracking_id) for item in targets} != set(expected):
+        entries = self._read_inventory(selected_id=tracking_id)
+        expected_names = {identity[1]: identity[0] for identity in expected}
+        self._report_entry_shapes(entries, expected_names, tracking_id)
+        matched = len(entries) == len(expected_names)
+        app_names = {}
+        for item in entries:
+            display_name = expected_names.get(item.tracking_id)
+            if item.kind == 'DSH':
+                valid = isinstance(display_name, str) and _DSH_DISPLAY.fullmatch(display_name)
+                if valid:
+                    app_names[item.tracking_id] = display_name
+            else:
+                valid = display_name == item.name
+            matched = matched and bool(valid)
+        if not matched:
             self._report('key_http_read_rejected', reason_code='KEY_LIST_IDENTITY_MISMATCH',
-                         key_count=len(targets), count=len(expected))
+                         key_count=len(entries), count=len(expected))
             raise KeyReadError('KEY_LIST_IDENTITY_MISMATCH')
-        selected = next(item for item in targets if (item.name, item.tracking_id) == requested)
-        self._report('key_http_target_verified', key_count=len(targets))
-        self._issued = selected
-        return selected
+        selected = next(item for item in entries if item.tracking_id == tracking_id)
+        try:
+            if selected.kind == 'DSH':
+                raise KeyReadError('KEY_TARGET_NOT_DELETABLE')
+            if selected.kind != 'NORMAL':
+                raise KeyReadError('KEY_TARGET_KIND_UNSUPPORTED')
+            prepared = _target(selected.row)
+            # Retain the existing ambiguity protection for the target's masked
+            # identifier, without demanding action fields from other entries.
+            if any(item.tracking_id != tracking_id
+                   and item.row.get('sensitive_id') == prepared.sensitive_id for item in entries):
+                raise KeyReadError('KEY_LIST_DUPLICATE_IDENTITY')
+        except KeyReadError as exc:
+            self._read_rejected(exc.reason_code, entry=selected, selected_id=tracking_id)
+            raise
+        self._report('key_http_target_verified', key_count=len(entries))
+        self._issued = prepared
+        self._app_managed_names = app_names
+        self._prepared_types = {item.tracking_id: item.kind for item in entries}
+        return prepared
 
     def submit_once(self, target, *, before_send):
         if (not isinstance(target, DeleteTarget) or target is not self._issued

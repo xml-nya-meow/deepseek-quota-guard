@@ -433,15 +433,18 @@ class PlatformKeyTests(unittest.TestCase):
             self.manager.submit_once(target, before_send=lambda: None)
         self.api.post.assert_called_once()
 
-    def test_read_keys_reuses_strict_duplicate_and_mask_validation(self):
+    def test_read_keys_requires_identity_but_not_unused_action_metadata(self):
         for field, value in (('tracking_id', self.expected[0]['tracking_id']),
                              ('sensitive_id', 'sk-not-a-redacted-key')):
             with self.subTest(field=field):
                 payload = copy.deepcopy(self.fixture['list_response'])
                 payload['data']['biz_data']['api_keys'][1][field] = value
                 self.replace_list(payload)
-                with self.assertRaises(GuardError):
-                    self.manager.read_keys()
+                if field == 'tracking_id':
+                    with self.assertRaises(GuardError):
+                        self.manager.read_keys()
+                else:
+                    self.assertEqual(self.manager.read_keys(), self.expected)
                 self.assertIsNone(self.manager._issued)
                 self.assertTrue(self.list_response.disposed)
         self.api.post.assert_not_called()

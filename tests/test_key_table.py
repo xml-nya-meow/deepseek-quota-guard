@@ -117,6 +117,19 @@ class KeyTableTests(unittest.TestCase):
         self.html = document(key_row(field=field))
         self.assertEqual(self.service._keys()[0]['tracking_id'], TARGET)
 
+    def test_row_lookup_after_page_reorders_uses_live_id_and_rejects_identity_change(self):
+        self.html = document(key_row('Same', TARGET) + key_row('Same', SURVIVOR))
+        self.service._keys()
+        self.page.evaluate('''() => {
+            const body = document.querySelector('tbody');
+            body.append(body.firstElementChild);
+        }''')
+        row, _, _ = self.service._key_row('Same', TARGET)
+        self.assertEqual(row.evaluate('el => el.sectionRowIndex'), 1)
+        self.page.evaluate("document.querySelector('tbody tr').firstElementChild.textContent = 'Renamed'")
+        with self.assertRaises(GuardError):
+            self.service._key_row('Same', TARGET)
+
     def test_missing_duplicate_or_ambiguous_table_headers_refuse(self):
         for headers in (['名称', 'Key', '创建日期', '最新使用日期', ''],
                         HEADERS + ['Tracking ID']):
